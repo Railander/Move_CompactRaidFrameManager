@@ -1,0 +1,9 @@
+package-as: Move_CompactRaidFrameManager
+enable-nolib-creation: no
+
+ignore:
+    - LICENSE
+    - CHANGES.txt
+    - README.md
+    - .gitignore
+    - .gitattributes

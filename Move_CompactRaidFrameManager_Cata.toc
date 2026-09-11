@@ -7,4 +7,4 @@
 ## X-Curse-Project-ID: 924959
 ## SavedVariables: Move_CompactRaidFrameManager
 
-Move_CompactRaidFrameManager_-_pre-TWW.lua
+Move_CompactRaidFrameManager.lua

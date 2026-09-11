@@ -1,4 +1,4 @@
-## Interface: 20505
+## Interface: 20506
 ## Version: @project-version@
 ## Title: Move Raid Manager
 ## Notes: Super lightweight addon that moves/autohides the default CompactRaidFrameManager, type /moverm for instructions.
@@ -7,4 +7,4 @@
 ## X-Curse-Project-ID: 924959
 ## SavedVariables: Move_CompactRaidFrameManager
 
-Move_CompactRaidFrameManager_-_pre-TWW.lua
+Move_CompactRaidFrameManager.lua

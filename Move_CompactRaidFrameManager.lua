@@ -23,16 +23,21 @@
 -- until one is chosen, and changing it never touches the raid frames' own
 -- strata.
 --
--- Midnight (12.x) restriction discipline, retail flavor only: while any addon
--- restriction is active (Combat/Encounter/ChallengeMode/PvPMatch/Map/Chat --
--- rated PvP and Mythic+ hold them out of combat, so the combat flag alone is
--- the wrong check) every gated call (SetPoint, SetShown, SetFrameStrata,
--- SetScript/HookScript, RegisterEvent, even anchor reads like GetPoint and
--- hover reads like IsMouseOver) silently refuses or queues instead of
--- attempting, and a /reload landing mid-protection defers all gated setup
--- until the lift is confirmed out-of-dispatch. Classic flavors have no gate
--- system and run unguarded. Safe while locked and never guarded: SetAlpha,
--- Show/Hide.
+-- Midnight (12.x) gate discipline, retail flavor only: there is none. Tainted
+-- calls on secret-clean objects serve under any restriction state
+-- (live-verified 2026-09-12, all six types forced: drags, settings, strata
+-- writes, installs, all clean), and nothing this addon touches can become
+-- secret-marked (it ingests no unit/combat/aura data; Blizzard doesn't mark
+-- chrome). So every op below just attempts -- no flag checks, no mark checks,
+-- no pcall, no read-back verification, no queues. If the engine ever refuses,
+-- it errors LOUDLY (Bugsack, not silence), which is exactly what we want: a
+-- silent queue would hide the bug forever, an error gets reported and fixed.
+-- The only guards left are crash-safety (nil results abort geometry) and
+-- correctness (the already-there early-out keeps default settings from
+-- touching Blizzard's anchors at all). Classic flavors run the same code.
+-- Safe everywhere: SetAlpha, FontString:SetText, Show/Hide, db work. Chat
+-- tutorial prints best-effort always (a swallowed line under Chat lockdown is
+-- harmless -- it is never load-bearing).
 
 local ADDON_NAME = "Move_CompactRaidFrameManager";
 
@@ -71,32 +76,20 @@ end
 local db; -- alias for the Move_CompactRaidFrameManager SavedVariables table, set on ADDON_LOADED
 local options, refreshWindow; -- config window and its refresher, built below
 
--- Restriction state (Midnight 12.x, retail flavor only). Declared HERE, above
--- every function that reads or writes them: Lua upvalues bind at closure
--- creation, so a later `local` would leave earlier paths writing to a
--- same-named global instead. Classic flavors never lock (no gate system --
--- the queries below always read false there), so one code path serves all.
-local MoveRM_restrictionsActive = false;
-local MoveRM_restrictedTypes = {}; -- per-type marks from ADDON_RESTRICTION_STATE_CHANGED payloads
-local MoveRM_gatedInitDeferred = false;
-local MoveRM_stateLoaded = false; -- db backfilled (pure Lua, safe anytime)
-local MoveRM_initDone = false; -- gated apply finished (capture/build/position/hooks)
-local MoveRM_hooksInstalled = false; -- toggle/fade post-hooks (HookScript is gated)
-local MoveRM_captured = false; -- stock placement/strata/family captured while clear
-local MoveRM_pendingPosition = false; -- Y re-apply skipped while locked
-local MoveRM_pendingStrata = false; -- strata apply skipped while locked
-local MoveRM_pendingFade = false; -- fade recompute skipped while locked
-local MoveRM_pendingGreet = false; -- first-run tutorial skipped while locked (chat is best-effort)
-local MoveRM_pendingWin = false; -- options-window re-anchor skipped while locked
+-- Install state. Declared HERE, above every function that reads or writes
+-- them: Lua upvalues bind at closure creation, so a later `local` would leave
+-- earlier paths writing to a same-named global instead.
+local MoveRM_stateLoaded = false; -- db backfilled (pure Lua, always runs)
+local MoveRM_hooksInstalled = false; -- post-hooks attempted once (HookScript chains)
+local MoveRM_captured = false; -- stock captured once (recapturing would adopt our moves)
 local MoveRM_moveModeOn = false; -- move mode: the green box + drag input are shown
 local MoveRM_moveDragging = false; -- a drag gesture is in flight (OnUpdate early-returns without it)
 local MoveRM_moveBox; -- green 50% box under the manager, marking its rect
 local MoveRM_moveInput; -- transparent drag input above the manager
 local MoveRM_grabDY; -- cursor offset from the manager's anchor Y at grab time
--- Forward declarations: assigned further below, called from early restriction
--- paths and mid-file appliers (bound here so they resolve correctly).
-local MoveRM_EnsureGatedInit;
-local MoveRM_FlushPending;
+-- Forward declarations: assigned further below, called from early paths and
+-- mid-file appliers (bound here so they resolve correctly).
+local MoveRM_EnsureInit;
 local MoveRM_RegisterAddonEvents;
 local MoveRM_DetachDrag;
 local MoveRM_DragUpdate;
@@ -104,11 +97,10 @@ local MoveRM_SetMoveMode;
 local MoveRM_BeginDrag;
 local MoveRM_EndDrag;
 local MoveRM_SyncMoveBox;
-local MoveRM_IsInteractionLocked;
 local MoveRM_EventFrame; -- listener frame, created at file load below
 
--- stock layout, captured while clear (every read below is gated except the
--- strata getters, so capturing defers as one with the rest of gated init)
+-- stock layout, captured once on init (recapturing later would adopt our
+-- own moves as the game's)
 local stockY = -140; -- the game's own vertical placement (both states sit at -140)
 local stockStrata; -- the game's own strata
 local stockStrataIndex = 2; -- db.strata value matching stockStrata (resolved at capture)
@@ -123,12 +115,11 @@ local managerFadesAsWhole; -- modern family (no single toggle button): fade the 
 local fadeRegions; -- classic family: the manager's own artwork plus its toggle button
 
 -- Capture the stock layout: the game's own placement and strata, the client
--- family, and the fade list. Gated reads (GetPoint most of all), so this
--- runs only while clear, inside gated init.
+-- family, and the fade list. Runs once (stock must predate our own moves --
+-- recapturing later would adopt our offset as the game's). The flag is managed
+-- by EnsureInit, which only sets it once the strata read lands (nil stock
+-- would poison reset, so a nil read simply retries next init).
 local function MoveRM_CaptureStock()
-	if MoveRM_captured then
-		return;
-	end
 	stockY = MoveRM_Round2(select(5, manager:GetPoint(1)) or -140);
 	stockStrata = manager:GetFrameStrata();
 	containerStrata = container:GetFrameStrata();
@@ -154,119 +145,11 @@ local function MoveRM_CaptureStock()
 			fadeRegions[#fadeRegions + 1] = manager.toggleButton;
 		end
 	end
-	MoveRM_captured = true;
 end
 
--- ----------------------------------------------------------------------------
--- Restriction state (Midnight 12.x): lock taint-able work while protected
--- ----------------------------------------------------------------------------
--- Six restriction types (Enum.AddOnRestrictionType, identical in every dump):
--- Combat, Encounter, ChallengeMode (M+), PvPMatch, Map, Chat. While ANY type
--- is active, gated calls from addon execution fail silently -- so while
--- locked this addon refuses or queues instead of attempting: every applier
--- below checks the lock FIRST (before even its gated reads like GetPoint or
--- IsMouseOver) and remembers the work for the lift. Chat notices never emit
--- on lock paths (they neither render while protected nor get read in combat
--- -- blocked input just does nothing). Safe while locked and never guarded:
--- SetAlpha, Show/Hide, db table work.
-local MoveRM_RESTRICTION_FALLBACK = { 0, 1, 2, 3, 4, 5 }; -- Combat..Chat
-local MoveRM_RESTRICTION_STATE = { inactive = 0, activating = 1, active = 2 };
-
-local function MoveRM_RestrictionTypeIDs()
-	if Enum and Enum.AddOnRestrictionType then
-		local t = Enum.AddOnRestrictionType;
-		local out = {};
-		for _, id in ipairs({ t.Combat, t.Encounter, t.ChallengeMode, t.PvPMatch, t.Map, t.Chat }) do
-			if id ~= nil then
-				out[#out + 1] = id;
-			end
-		end
-		if #out > 0 then
-			return out;
-		end
-	end
-	return MoveRM_RESTRICTION_FALLBACK;
-end
-
-local function MoveRM_RestrictionStateID(name)
-	if Enum and Enum.AddOnRestrictionState and Enum.AddOnRestrictionState[name] ~= nil then
-		return Enum.AddOnRestrictionState[name];
-	end
-	return MoveRM_RESTRICTION_STATE[name];
-end
-
--- Full all-types query. Must NEVER run during ADDON_RESTRICTION_STATE_CHANGED
--- dispatch (IsAddOnRestrictionActive reads false there by design); that
--- handler maintains per-type marks from the payload instead.
-local function MoveRM_AreRestrictionsActive()
-	if C_RestrictedActions and C_RestrictedActions.IsAddOnRestrictionActive then
-		for _, rtype in ipairs(MoveRM_RestrictionTypeIDs()) do
-			local ok, active = pcall(C_RestrictedActions.IsAddOnRestrictionActive, rtype);
-			if ok and active then
-				return true;
-			end
-		end
-		return false;
-	end
-	if InCombatLockdown then
-		return InCombatLockdown() and true or false;
-	end
-	return false;
-end
-
--- Live check: the latched flag covers dispatch windows where the query reads
--- false by design; the query covers events missed while a registration was
--- down. Either side locks. Callers are input/event-driven (never per-frame),
--- so the handful of pcall'd queries per gesture is negligible.
-MoveRM_IsInteractionLocked = function()
-	return MoveRM_restrictionsActive or MoveRM_AreRestrictionsActive();
-end
-
-local function MoveRM_ApplyRestrictionsActive()
-	MoveRM_restrictionsActive = true;
-	-- end an in-flight drag without touching gates: the flag stops the
-	-- OnUpdate (hidden frames tick nothing anyway) and the detach below is
-	-- best-effort -- while enforced it stays as a nil-cost early-return until
-	-- the next unrestricted stop or lift detaches it. The box itself stays
-	-- put: the manager cannot move either, so it stays accurate.
-	MoveRM_moveDragging = false;
-	MoveRM_DetachDrag();
-end
-
-local function MoveRM_ApplyRestrictionsCleared()
-	MoveRM_restrictionsActive = false;
-	for k in pairs(MoveRM_restrictedTypes) do
-		MoveRM_restrictedTypes[k] = nil;
-	end
-	MoveRM_EnsureGatedInit();
-end
-
--- Re-query outside event dispatch; clears the lock only when every type is idle.
-local function MoveRM_ConfirmRestrictionsCleared()
-	if not MoveRM_AreRestrictionsActive() then
-		MoveRM_ApplyRestrictionsCleared();
-	end
-end
-
--- Re-query and apply whichever side is true. Both sides are silent. The clear
--- side is cheap when there is nothing to resume: only a lock episode, a
--- deferred init, queued work, or a never-finished init runs the full resume.
-local function MoveRM_RefreshRestrictionState()
-	if MoveRM_AreRestrictionsActive() then
-		MoveRM_ApplyRestrictionsActive();
-		return true;
-	end
-	if MoveRM_restrictionsActive or MoveRM_gatedInitDeferred or not MoveRM_initDone
-		or MoveRM_pendingPosition or MoveRM_pendingStrata or MoveRM_pendingFade then
-		MoveRM_ApplyRestrictionsCleared();
-	end
-	return false;
-end
-
--- ----------------------------------------------------------------------------
--- core behavior: every applier checks the lock FIRST (before even its gated
--- reads) and queues instead of attempting, so a call from any path -- hooks,
--- slash, options, lift flush -- is safe by construction
+-- core behavior: every op below just attempts. A call from any path --
+-- hooks, slash, options, events -- runs the same straight-line code; there
+-- is no lock state, no queue, nothing to flush
 -- ----------------------------------------------------------------------------
 local function MoveRM_SetAlpha(alpha)
 	if managerFadesAsWhole then
@@ -278,36 +161,78 @@ local function MoveRM_SetAlpha(alpha)
 	end
 end
 
+-- Hover covers the manager body AND its toggle strip: sliding from the body
+-- onto the expand/collapse button fires the manager's OnLeave (the child
+-- captures the mouse) while the cursor never leaves the manager's visible
+-- area -- and Frame:IsMouseOver checks only its own rect (which is why
+-- Blizzard code routinely tests parent and child separately). A bare manager
+-- read would hide under the cursor, most visibly collapsed, where the strip
+-- is the only visible sliver.
+-- A nil read means the engine refused to answer: propagate nil (never
+-- coerce here) so the caller can fail visible.
+local function MoveRM_IsHovering()
+	local m = manager:IsMouseOver();
+	if m == nil then
+		return nil;
+	end
+	if m then
+		return true;
+	end
+	for _, key in ipairs({ "toggleButton", "toggleButtonBack", "toggleButtonForward" }) do
+		local button = manager[key];
+		if button then
+			local b = button:IsMouseOver();
+			if b == nil then
+				return nil;
+			end
+			if b then
+				return true;
+			end
+		end
+	end
+	return false;
+end
+
 -- autohide: the manager is only faded out while it sits collapsed and the
 -- cursor is elsewhere (an alpha-0 frame still receives mouse events, so
--- hovering it brings it back). IsMouseOver is gated: while locked the last
--- fade state stands and the recompute queues for the lift.
-local function MoveRM_ApplyFade()
-	if not db or not MoveRM_captured then
+-- hovering it brings it back). SetAlpha is the designated secret-display sink
+-- (AllowedWhenTainted) and always lands, marked or not; only the hover reads
+-- are mark-checked. The OnEnter events themselves are a hover signal, so
+-- reveal needs no read at all.
+local function MoveRM_ApplyFade(hovered)
+	if not db then
 		return;
 	end
-	if MoveRM_IsInteractionLocked() then
-		MoveRM_pendingFade = true;
+	if managerFadesAsWhole == nil then
+		-- plain Lua field read, safe anytime (no gate): the modern/classic
+		-- split is fixed for the session, so the fade can route without
+		-- waiting for the stock capture
+		managerFadesAsWhole = manager.toggleButton == nil;
+	end
+	if not managerFadesAsWhole and not MoveRM_captured then
+		return; -- regions unknown until capture runs
+	end
+	if hovered then
+		MoveRM_SetAlpha(1);
 		return;
 	end
-	local hidden = db.fade and manager.collapsed and not manager:IsMouseOver();
+	local over = MoveRM_IsHovering();
+	if over == nil then
+		over = true; -- unknown hover fails visible: a shown manager is usable
+	end
+	local hidden = db.fade and manager.collapsed and not over;
 	MoveRM_SetAlpha(hidden and 0 or 1);
 end
 
 -- Re-apply the saved Y over the manager's current anchor. Blizzard only
 -- re-anchors the manager on expand/collapse (traced across the whole 12.1
 -- tree), and the toggle post-hooks below call this right after, so the
--- offset survives with no override of Blizzard's methods. GetPoint is gated:
--- while locked the Blizzard anchor stands until the lift flush.
+-- offset survives with no override of Blizzard's methods.
 local function MoveRM_ApplyPosition()
-	if not db or not MoveRM_captured then
+	if not db then
 		return;
 	end
-	if MoveRM_IsInteractionLocked() then
-		MoveRM_pendingPosition = true;
-		return;
-	end
-	local count = manager:GetNumPoints();
+	local count = manager:GetNumPoints() or 0;
 	local point, relativeTo, relativePoint, x, y = manager:GetPoint(count > 0 and count or 1);
 	if not point then
 		return;
@@ -321,18 +246,14 @@ local function MoveRM_ApplyPosition()
 end
 
 local function MoveRM_ApplyStrata()
-	if not db or not MoveRM_captured then
+	if not db then
 		return;
 	end
-	if MoveRM_IsInteractionLocked() then
-		MoveRM_pendingStrata = true;
-		return;
+	local want = (db.strata and STRATAS[db.strata]) or stockStrata;
+	if want == nil or containerStrata == nil then
+		return; -- stock unknown: nothing sane to write yet
 	end
-	if db.strata then
-		manager:SetFrameStrata(STRATAS[db.strata]);
-	else
-		manager:SetFrameStrata(stockStrata); -- pre-backfill safety net
-	end
+	manager:SetFrameStrata(want);
 	-- re-assert the raid frames' own strata: as the manager's child (classic)
 	-- it would otherwise inherit the manager's change
 	container:SetFrameStrata(containerStrata);
@@ -347,9 +268,9 @@ local function MoveRM_SetStrata(strata)
 end
 
 -- restore every setting to the game's own behavior (db work is pure Lua and
--- always lands; the applies queue themselves while locked). Every saved
--- value goes back, including the config window's own position -- as if the
--- addon was never enabled.
+-- always lands). Every
+-- saved value goes back, including the config window's own position -- as if
+-- the addon was never enabled.
 local function MoveRM_Reset()
 	if not db then
 		return;
@@ -359,27 +280,21 @@ local function MoveRM_Reset()
 	if MoveRM_captured then
 		MoveRM_SetStrata(stockStrataIndex);
 	else
-		-- stock index unknown yet (locked boot): clear for the capture-time
-		-- backfill and queue the apply for the lift flush
+		-- stock index unknown yet: clear for the capture-time backfill
 		db.strata = nil;
-		MoveRM_pendingStrata = true;
 	end
 	MoveRM_ApplyPosition(); -- restores the game's own placement
 	MoveRM_ApplyFade();
 	-- note: reset touches values only -- the window stays open and move mode
 	-- stays on (the box follows the reset spot through refreshWindow below)
 	if options then
-		if MoveRM_IsInteractionLocked() then
-			MoveRM_pendingWin = true;
-		else
-			options:ClearAllPoints();
-			options:SetPoint("CENTER", UIParent, "CENTER", 0, 0);
-		end
+		options:ClearAllPoints();
+		options:SetPoint("CENTER", UIParent, "CENTER", 0, 0);
 	end
 	if refreshWindow then
 		refreshWindow(); -- the window (and the move box) follows the reset
 	end
-	if options and options.yBox and not MoveRM_IsInteractionLocked() then
+	if options and options.yBox then
 		-- force the Y box: it may hold keyboard focus or a format-equal
 		-- string ("-140.0") that the conditional refresh skips, leaving
 		-- stale visible text on the real client
@@ -435,11 +350,9 @@ end
 -- per-frame cost outside of it. Vertical only: the manager's X always belongs
 -- to its collapsed/expanded stock anchor.
 
--- Best-effort OnUpdate detach: the script needs gates, so while locked it
--- stays as a nil-cost early-return (hidden frames tick nothing anyway) until
--- the next unrestricted stop or lift detaches it.
+-- Best-effort OnUpdate detach on our own input frame: always safe.
 MoveRM_DetachDrag = function()
-	if MoveRM_moveInput and not MoveRM_IsInteractionLocked() then
+	if MoveRM_moveInput then
 		MoveRM_moveInput:SetScript("OnUpdate", nil);
 	end
 end;
@@ -477,21 +390,21 @@ end
 
 -- Shared drag endpoints: the move input AND the toggle-strip buttons both
 -- drive them, so the strip is dual-purpose -- a plain press runs Blizzard's
--- own click natively (expand/collapse, working locked and clear), while a
--- press-and-move becomes a manager drag. The OnUpdate always lives on the
--- move input (shown throughout move mode); the buttons only initiate.
+-- own click natively (expand/collapse, always), while a press-and-move
+-- becomes a manager drag. The OnUpdate always lives on the move input (shown
+-- throughout move mode); the buttons only initiate.
 MoveRM_BeginDrag = function(self)
 	if not db or not MoveRM_moveModeOn then
 		return; -- outside move mode the strip is click-only, as stock
-	end
-	if MoveRM_IsInteractionLocked() then
-		return; -- silently refuse: blocked input just does nothing
 	end
 	-- capture where the cursor grabbed relative to the manager's anchor:
 	-- db.y already IS the anchor's Y in UI units, so the grab is exact
 	-- and the manager cannot jump by a single pixel, whatever the scale
 	local _, ph = UIParent:GetSize();
 	local _, cy = GetCursorPosition(); -- already in UI units on this client
+	if cy == nil then
+		return; -- cursor unreadable: refuse the grab without touching anything
+	end
 	MoveRM_grabDY = cy - (ph + db.y);
 	MoveRM_moveDragging = true;
 	if MoveRM_moveInput then
@@ -500,29 +413,30 @@ MoveRM_BeginDrag = function(self)
 end
 
 MoveRM_EndDrag = function(self)
-	if MoveRM_moveDragging and not MoveRM_IsInteractionLocked() then
+	if MoveRM_moveDragging then
 		MoveRM_DragUpdate(); -- exact final position (drag still active)
 	end
 	MoveRM_moveDragging = false;
 	MoveRM_DetachDrag();
 end
 
--- Re-anchor the box and the input over the manager's current rect. Gated
--- throughout (GetPoint/GetSize/SetPoint): callers ensure a clear context, and
--- the guard below keeps it safe by construction anyway.
+-- Re-anchor the box and the input over the manager's current rect. Only the
+-- manager reads are mark-checked (everything written here is our own frames);
+-- returns whether the box now mirrors the manager (move-mode entry refuses
+-- otherwise -- showing a wrong box is worse than showing none).
 MoveRM_SyncMoveBox = function()
 	if not MoveRM_moveBox or not db then
-		return;
+		return false;
 	end
-	if MoveRM_IsInteractionLocked() then
-		return;
-	end
-	local count = manager:GetNumPoints();
+	local count = manager:GetNumPoints() or 0;
 	local point, relativeTo, relativePoint, x = manager:GetPoint(count > 0 and count or 1);
 	if not point then
-		return;
+		return false;
 	end
 	local w, h = manager:GetSize();
+	if w == nil or h == nil then
+		return false;
+	end
 	MoveRM_moveBox:ClearAllPoints();
 	MoveRM_moveBox:SetPoint(point, relativeTo, relativePoint, x, db.y);
 	MoveRM_moveBox:SetSize(w, h);
@@ -543,27 +457,28 @@ MoveRM_SyncMoveBox = function()
 		MoveRM_moveInput:SetPoint(point, relativeTo, relativePoint, x, db.y);
 		MoveRM_moveInput:SetSize(w, h);
 	end
+	return true;
 end;
 
 MoveRM_DragUpdate = function()
 	if not MoveRM_moveDragging then
-		return; -- idle frame: return before the lock query (nil per-frame cost)
+		return; -- idle frame: cheapest possible return, no queries at all
 	end
 	if not db then
 		MoveRM_moveDragging = false;
 		return;
 	end
-	if MoveRM_IsInteractionLocked() then
-		-- protection landed mid-drag: end the gesture without persisting
-		-- anything further (db keeps the pre-lock spot for the part after).
+	local _, ph = UIParent:GetSize();
+	local _, cy = GetCursorPosition(); -- already in UI units on this client
+	if cy == nil then
+		-- cursor unreadable mid-drag: end the gesture without persisting
+		-- anything further (db keeps the last good spot)
 		MoveRM_moveDragging = false;
 		MoveRM_DetachDrag();
 		return;
 	end
-	local _, ph = UIParent:GetSize();
-	local _, cy = GetCursorPosition(); -- already in UI units on this client
 	db.y = MoveRM_Round2(cy - MoveRM_grabDY - ph);
-	MoveRM_ApplyPosition();
+		MoveRM_ApplyPosition(); -- re-asserts over the stock re-anchor
 	MoveRM_SyncMoveBox();
 	if refreshWindow then
 		refreshWindow(); -- the Y box updates live while dragging
@@ -572,20 +487,18 @@ end
 
 MoveRM_SetMoveMode = function(on)
 	if on then
-		if MoveRM_IsInteractionLocked() then
-			return; -- move mode needs gated installs/anchors: leave it off while locked
-		end
 		MoveRM_BuildMoveUI();
 		if not MoveRM_moveBox then
 			return;
 		end
-		MoveRM_SyncMoveBox();
+		if not MoveRM_SyncMoveBox() then
+			return; -- manager unreadable (marked): no box is better than a wrong one
+		end
 		MoveRM_moveBox:Show();
 		MoveRM_moveInput:Show();
 		MoveRM_moveModeOn = true;
 	else
-		-- exiting is always safe: Hide is ungated and the detach/label below
-		-- guard themselves, so move mode can be left even while locked
+		-- exiting is always safe
 		MoveRM_moveModeOn = false;
 		MoveRM_moveDragging = false;
 		MoveRM_DetachDrag();
@@ -596,15 +509,13 @@ MoveRM_SetMoveMode = function(on)
 			MoveRM_moveInput:Hide();
 		end
 	end
-	if options and options.moveBtn and not MoveRM_IsInteractionLocked() then
-		-- Button:SetText is gated: refresh the label only when clear (the
-		-- lift flush re-syncs it through refreshWindow)
+	if options and options.moveBtn then
 		options.moveBtn:SetText(MoveRM_moveModeOn and "stop moving" or "move manager");
 	end
 end
 
 -- ----------------------------------------------------------------------------
--- config window, built on gated init inside a pcall: even if a widget template
+-- config window, built on init inside a pcall: even if a widget template
 -- is missing in some client flavor, the manager keeps working
 -- ----------------------------------------------------------------------------
 local function MoveRM_MakeLabel(parent, text, fontObject, point, relativeTo, relPoint, x, y)
@@ -631,12 +542,12 @@ local function MoveRM_MakeEditBox(parent, width, maxLetters, point, relativeTo, 
 	box:SetMaxLetters(maxLetters);
 	box:SetJustifyH("CENTER");
 	box:SetScript("OnEscapePressed", function(self)
-		self:ClearFocus();
+		self:ClearFocus(); -- own frame: always servable
 	end);
 	box:SetScript("OnEnterPressed", function(self)
 		self:ClearFocus();
 		if db then
-			onEnter(self:GetText());
+			onEnter(self:GetText()); -- GetText reads are safe
 		end
 	end);
 	return box;
@@ -651,15 +562,9 @@ local function MoveRM_BuildWindow()
 	options:RegisterForDrag("LeftButton");
 	options:SetClampedToScreen(true);
 	options:SetScript("OnDragStart", function(self)
-		if MoveRM_IsInteractionLocked() then
-			return; -- StartMoving is gated: the window stays put while protected
-		end
-		self:StartMoving();
+		self:StartMoving(); -- own frame: always servable
 	end);
 	options:SetScript("OnDragStop", function(self)
-		if MoveRM_IsInteractionLocked() then
-			return; -- StopMovingOrSizing + re-anchor are gated; position unsaved
-		end
 		self:StopMovingOrSizing();
 		if db then
 			local pw, ph = UIParent:GetSize();
@@ -713,9 +618,9 @@ local function MoveRM_BuildWindow()
 	options.moveBtn:SetPoint("TOP", options, "TOP", 0, -6);
 	options.moveBtn:SetScript("OnClick", function()
 		if MoveRM_moveModeOn then
-			MoveRM_SetMoveMode(false); -- exiting is always safe, even while locked
+			MoveRM_SetMoveMode(false);
 		else
-			MoveRM_SetMoveMode(true); -- entering refuses silently while locked
+			MoveRM_SetMoveMode(true); -- refuses itself when unmeasurable
 		end
 	end);
 
@@ -726,7 +631,7 @@ local function MoveRM_BuildWindow()
 		v = tonumber(v);
 		if v and v >= -MAX_COORD and v <= MAX_COORD then
 			db.y = MoveRM_Round2(v);
-			MoveRM_ApplyPosition(); -- queues itself while locked (db already correct)
+			MoveRM_ApplyPosition(); -- db already correct, frame follows
 			if refreshWindow then
 				refreshWindow();
 			end
@@ -744,16 +649,14 @@ local function MoveRM_BuildWindow()
 			return;
 		end
 		db.fade = self:GetChecked() and true or false;
-		MoveRM_ApplyFade(); -- queues itself while locked (db already correct)
+		MoveRM_ApplyFade(); -- db already correct, frame follows
 	end);
 
 	function refreshWindow()
 		if not db or not options.yBox then
 			return;
 		end
-		if MoveRM_IsInteractionLocked() then
-			return; -- EditBox/Button writes are gated: refresh on lift
-		end
+		-- own frames throughout: every write below serves, marked or not.
 		if tonumber(options.yBox:GetText()) ~= db.y then
 			options.yBox:SetText(tostring(db.y));
 		end
@@ -765,7 +668,7 @@ local function MoveRM_BuildWindow()
 			options.moveBtn:SetText(MoveRM_moveModeOn and "stop moving" or "move manager");
 		end
 		if MoveRM_moveModeOn then
-			MoveRM_SyncMoveBox(); -- the box follows typed/reset changes too
+			MoveRM_SyncMoveBox(); -- self-guarded: no-op when unmeasurable
 		end
 	end
 
@@ -816,7 +719,7 @@ local function MoveRM_BuildStrataPicker()
 					return db.strata == data;
 				end,
 				function(data)
-					MoveRM_SetStrata(data); -- queues itself while locked
+					MoveRM_SetStrata(data); -- db already correct, frame follows
 					if refreshWindow then
 						refreshWindow();
 					end
@@ -833,7 +736,7 @@ local function MoveRM_BuildStrataFallback()
 			return;
 		end
 		-- cycle the real values only, wrapping around (never a placeholder)
-		MoveRM_SetStrata((db.strata or 0) % MAX_STRATA + 1); -- queues itself while locked
+		MoveRM_SetStrata((db.strata or 0) % MAX_STRATA + 1); -- db already correct
 		if refreshWindow then
 			refreshWindow();
 		end
@@ -841,13 +744,14 @@ local function MoveRM_BuildStrataFallback()
 end
 
 -- ----------------------------------------------------------------------------
--- Load (pure Lua, safe anytime) vs gated init (deferred while protected)
+-- Load (pure Lua, always) + init (attempt everything at file scope, on load,
+-- and on slash)
 -- ----------------------------------------------------------------------------
 
--- Backfill the db from SavedVariables. Pure Lua table work only: safe under
--- any restriction, so a /reload-in-combat still lands its state and only the
--- gated apply waits for the lift. Returns false on a missing manager (inert
--- before touching SavedVariables). Idempotent.
+-- Backfill the db from SavedVariables. Pure Lua table work only. Returns
+-- false on a missing manager (inert before touching SavedVariables).
+-- Idempotent. The first-run tutorial prints best-effort, chat lockdown or
+-- not -- it is never load-bearing.
 local function MoveRM_LoadState()
 	if MoveRM_stateLoaded then
 		return true;
@@ -864,65 +768,28 @@ local function MoveRM_LoadState()
 	end
 	MoveRM_Sanitize(db);
 	if freshDB then
-		if MoveRM_IsInteractionLocked() then
-			MoveRM_pendingGreet = true; -- chat is best-effort: greet on lift
-		else
-			MoveRM_instructions();
-		end
+		MoveRM_instructions();
 	end
 	MoveRM_stateLoaded = true;
 	return true;
 end
 
--- Flush work queued while locked. Runs only when clear.
-MoveRM_FlushPending = function()
-	if not MoveRM_stateLoaded or MoveRM_IsInteractionLocked() then
-		return;
-	end
-	if MoveRM_pendingGreet then
-		MoveRM_pendingGreet = false;
-		MoveRM_instructions();
-	end
-	if MoveRM_pendingPosition then
-		MoveRM_pendingPosition = false;
-		MoveRM_ApplyPosition();
-	end
-	if MoveRM_pendingStrata then
-		MoveRM_pendingStrata = false;
-		MoveRM_ApplyStrata();
-	end
-	if MoveRM_pendingWin then
-		MoveRM_pendingWin = false;
-		if options then
-			options:ClearAllPoints();
-			options:SetPoint("CENTER", UIParent, "CENTER", db.win.x, db.win.y);
-		end
-	end
-	if MoveRM_pendingFade then
-		MoveRM_pendingFade = false;
-		MoveRM_ApplyFade();
-	end
-	if MoveRM_moveModeOn then
-		MoveRM_SyncMoveBox(); -- a locked rebuild may have moved/resized the manager
-	end
-	if refreshWindow then
-		refreshWindow();
-	end
-end;
 
--- Install the fade/toggle post-hooks. HookScript is gated, so this runs only
--- while clear, inside gated init. The hooks run after Blizzard's own
--- handlers: the stock OnClick first flips collapsed and re-anchors through
--- Blizzard's own untainted execution (which keeps working while locked),
--- then ours re-applies the saved Y -- or queues it while locked.
+-- Install the fade/toggle post-hooks. Attempted unconditionally; the hooks
+-- run after Blizzard's own handlers: the stock OnClick first flips collapsed
+-- and re-anchors, then ours re-applies the saved Y.
 local function MoveRM_InstallHooks()
 	if MoveRM_hooksInstalled then
 		return;
 	end
-	-- the fade inputs change when the manager is shown, hovered or toggled
-	manager:HookScript("OnShow", MoveRM_ApplyFade);
-	manager:HookScript("OnEnter", MoveRM_ApplyFade);
-	manager:HookScript("OnLeave", MoveRM_ApplyFade);
+	-- the fade inputs change when the manager is shown, hovered or toggled.
+	-- Enter carries its own hover signal (no read needed); the rest recompute
+	-- against body-or-strip. The strip gets its own Enter/Leave pair: it is
+	-- a child, so hovering it fires the manager's Leave while the cursor is
+	-- still on the visible area.
+	manager:HookScript("OnShow", function() MoveRM_ApplyFade(); end);
+	manager:HookScript("OnEnter", function() MoveRM_ApplyFade(true); end);
+	manager:HookScript("OnLeave", function() MoveRM_ApplyFade(); end);
 	-- the manager body itself initiates drags too: the move input above it
 	-- leaves the toggle-strip column out, so when collapsed (only the strip
 	-- shows) the visible sliver would otherwise not drag. A plain press still
@@ -938,13 +805,24 @@ local function MoveRM_InstallHooks()
 	for _, key in ipairs({ "toggleButton", "toggleButtonBack", "toggleButtonForward" }) do
 		local button = manager[key];
 		if button then
-			button:HookScript("OnClick", function()
-				MoveRM_ApplyPosition();
-				MoveRM_ApplyFade();
-				if MoveRM_moveModeOn then
-					MoveRM_SyncMoveBox(); -- the box follows expand/collapse
-				end
-			end);
+		button:HookScript("OnClick", function()
+			MoveRM_ApplyPosition();
+			MoveRM_ApplyFade();
+			if MoveRM_moveModeOn then
+				MoveRM_SyncMoveBox(); -- the box follows expand/collapse
+			end
+		end);
+		-- fade follows the strip too: the buttons are children, so sliding
+		-- from the body onto them fires the manager's OnLeave while the
+		-- cursor is still on the manager's visible area (collapsed, the
+		-- strip is ALL that shows). Enter carries its own hover signal;
+		-- Leave recomputes against body-or-strip.
+		button:HookScript("OnEnter", function()
+			MoveRM_ApplyFade(true);
+		end);
+		button:HookScript("OnLeave", function()
+			MoveRM_ApplyFade();
+		end);
 			-- dual-purpose strip: a plain press runs the stock click above
 			-- natively, while a press-and-move drags the manager (move mode
 			-- only). RegisterForDrag never blocks clicks -- the client still
@@ -958,25 +836,27 @@ local function MoveRM_InstallHooks()
 			end);
 		end
 	end
+	-- installs are attempted once (HookScript chains, so repeats would stack
+	-- duplicate wrappers): if the engine ever refuses, it errors loudly and
+	-- we hear about it.
 	MoveRM_hooksInstalled = true;
 end
 
--- Idempotent gated setup: captures the stock layout, (re)registers events,
--- builds the options window, installs the post-hooks and runs the deferred
--- login apply. Safe to call from any event or slash entry; defers (and
--- remembers) while protected so a /reload-in-combat never half-installs
--- silently. On classic flavors the lock never engages, so this runs straight
--- through exactly like the old load path.
-MoveRM_EnsureGatedInit = function()
-	if MoveRM_IsInteractionLocked() then
-		MoveRM_gatedInitDeferred = true;
-		return false;
-	end
-	MoveRM_gatedInitDeferred = false;
+-- Setup, run at file scope (pre-SV: registers, captures, hooks, builds)
+-- and again on ADDON_LOADED and slash (cheap idempotent re-entry:
+-- registration no-ops, capture/hooks run once, applies re-assert).
+-- The first apply waits for state (db guard below).
+MoveRM_EnsureInit = function()
 	MoveRM_RegisterAddonEvents();
-	MoveRM_CaptureStock();
+
+	if not MoveRM_captured then
+		MoveRM_CaptureStock();
+		if stockStrata ~= nil then
+			MoveRM_captured = true;
+		end
+	end
 	MoveRM_InstallHooks();
-	if db and db.strata == nil then
+	if MoveRM_captured and db and db.strata == nil then
 		db.strata = stockStrataIndex; -- preselect the game's own strata
 	end
 	if not options then
@@ -991,7 +871,7 @@ MoveRM_EnsureGatedInit = function()
 			pcall(MoveRM_BuildStrataFallback);
 		end
 	end
-	if MoveRM_stateLoaded and not MoveRM_initDone then
+	if MoveRM_stateLoaded then
 		MoveRM_ApplyPosition(); -- positions over the login re-anchor
 		MoveRM_ApplyStrata(); -- db.strata is backfilled above, always explicit
 		MoveRM_ApplyFade();
@@ -1002,76 +882,42 @@ MoveRM_EnsureGatedInit = function()
 				refreshWindow();
 			end
 		end
-		MoveRM_initDone = true;
 	end
-	MoveRM_FlushPending();
-	return true;
 end;
 
 -- ----------------------------------------------------------------------------
 -- login and persist through sessions functionality
 -- ----------------------------------------------------------------------------
-local function MoveRM_OnEvent(self, event, arg1, arg2)
+local function MoveRM_OnEvent(self, event, arg1)
 	if event == "ADDON_LOADED" then
 		if arg1 == ADDON_NAME then
-			-- UnregisterEvent is itself gated: skip while locked (the
-			-- handler is idempotent, a lingering registration is harmless).
-			if not MoveRM_IsInteractionLocked() then
-				self:UnregisterEvent("ADDON_LOADED");
-			end
 			if MoveRM_LoadState() then
-				MoveRM_EnsureGatedInit();
+				MoveRM_EnsureInit();
 			end
+			-- unregister LAST: EnsureInit re-registers everything above,
+			-- so unsubscribing first would resurrect in the same tick.
+			-- The handler is idempotent anyway, so a lingering
+			-- registration would be harmless regardless.
+			self:UnregisterEvent("ADDON_LOADED");
 		end
-	elseif event == "ADDON_RESTRICTION_STATE_CHANGED" then
-		-- Payload is (restrictionType, newState). IsAddOnRestrictionActive
-		-- reads FALSE during this dispatch by design, so never query here --
-		-- maintain per-type marks from the payload and confirm outside.
-		if arg2 == MoveRM_RestrictionStateID("inactive") then
-			if arg1 ~= nil then MoveRM_restrictedTypes[arg1] = nil; end
-			if next(MoveRM_restrictedTypes) == nil then
-				if C_Timer and C_Timer.After then
-					C_Timer.After(0, MoveRM_ConfirmRestrictionsCleared);
-				end
-			end
-		else
-			-- Activating (fired before enforcement starts), Active, or unknown.
-			if arg1 ~= nil then MoveRM_restrictedTypes[arg1] = true; end
-			MoveRM_ApplyRestrictionsActive();
-		end
-	elseif event == "PLAYER_REGEN_DISABLED" then
-		-- Entering combat: mark locked only if the query agrees. The lock
-		-- transition is silent by design.
-		MoveRM_RefreshRestrictionState();
-	elseif event == "PLAYER_REGEN_ENABLED" then
-		-- Backstop wake-up: covers a restriction-changed registration missed
-		-- during a /reload-in-combat.
-		MoveRM_RefreshRestrictionState();
-	elseif event == "PLAYER_ENTERING_WORLD" or event == "ZONE_CHANGED" or event == "ZONE_CHANGED_NEW_AREA" then
-		-- Zone crossings (M+/rated maps restrict on entry, out of combat):
-		-- re-check protected status, flush queued work on lift.
-		MoveRM_RefreshRestrictionState();
-		if MoveRM_moveModeOn then
-			MoveRM_SyncMoveBox(); -- zoning rebuilds the panel: box follows
-		end
-	elseif event == "GROUP_ROSTER_UPDATE" or event == "PARTY_LEADER_CHANGED" then
-		-- Blizzard rebuilds the panel here (options flow, heights): keep the
-		-- move box on the manager's rect (self-guarded: no-op unless moving)
+	elseif event == "PLAYER_ENTERING_WORLD" or event == "ZONE_CHANGED"
+		or event == "ZONE_CHANGED_NEW_AREA" or event == "GROUP_ROSTER_UPDATE"
+		or event == "PARTY_LEADER_CHANGED" then
+		-- Blizzard rebuilds the panel on crossings and roster changes
+		-- (options flow, heights): keep the move box on the manager's rect.
+		-- Box sync is a no-op unless move mode is on; unmeasurable rects
+		-- simply skip.
 		if MoveRM_moveModeOn then
 			MoveRM_SyncMoveBox();
 		end
 	end
 end
 
--- All event installs funnel through here so a deferred boot can retry them
--- idempotently once protection lifts. Re-registering is a no-op and the
--- script is simply replaced.
+-- All event installs funnel through here. Re-registering is a no-op and the
+-- script is simply replaced, so repeated EnsureInit calls stay cheap.
 local function MoveRM_RegisterAddonEventsInner()
 	if not MoveRM_EventFrame then return end
 	MoveRM_EventFrame:RegisterEvent("ADDON_LOADED");
-	MoveRM_EventFrame:RegisterEvent("ADDON_RESTRICTION_STATE_CHANGED");
-	MoveRM_EventFrame:RegisterEvent("PLAYER_REGEN_DISABLED");
-	MoveRM_EventFrame:RegisterEvent("PLAYER_REGEN_ENABLED");
 	MoveRM_EventFrame:RegisterEvent("PLAYER_ENTERING_WORLD");
 	MoveRM_EventFrame:RegisterEvent("ZONE_CHANGED");
 	MoveRM_EventFrame:RegisterEvent("ZONE_CHANGED_NEW_AREA");
@@ -1084,11 +930,10 @@ MoveRM_RegisterAddonEvents = MoveRM_RegisterAddonEventsInner;
 
 MoveRM_EventFrame = CreateFrame("Frame", "Move_CompactRaidFrameManagerEventFrame");
 
--- Boot-time restriction evaluation: a /reload landing mid-protection
--- silently defers all gated setup instead of half-installing. Recovery order
--- on lift: restriction-changed confirm, regen-enabled, zone re-check, next
--- slash use (lazy self-heal in the slash handler below).
-MoveRM_EnsureGatedInit();
+-- File scope runs before SavedVariables land: register (so our own
+-- ADDON_LOADED is heard), capture stock, install hooks, build the window.
+-- The first apply waits for state in the ADDON_LOADED handler below.
+MoveRM_EnsureInit();
 
 -- ----------------------------------------------------------------------------
 -- slash command functionality: bare /moverm (or anything unrecognized)
@@ -1101,9 +946,9 @@ SlashCmdList.MOVERM = function(msg)
 			return; -- unknown layout: inert, SavedVariables untouched
 		end
 	end
-	-- self-heal: a missed ADDON_LOADED (deaf boot under protection) resumes
-	-- here once clear; no-op while locked.
-	MoveRM_EnsureGatedInit();
+	-- re-entry is cheap and idempotent: a missed ADDON_LOADED (refused
+	-- registration) resumes here.
+	MoveRM_EnsureInit();
 	if not db then
 		return; -- settings are not loaded yet
 	end

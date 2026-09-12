@@ -1,5 +1,10 @@
 # Move Raid Manager Changelog
 
+## v2.1.0
+- Everything now works while fighting: moving the manager, typing coordinates, toggling autohide, changing strata and moving the config window all apply instantly mid-combat and in Mythic+ / rated PvP, with no errors.
+- Fixed: hovering the collapsed expand button reveals the manager again (only the window body woke it before).
+- Fixed: the autohide now kicks in right after a UI reload mid-fight, like it always used to.
+
 ## v2.0.0
 - Rewritten as a single implementation shared by every game version, with the raid manager's own behavior on each version learned directly from that version's UI code.
 - New: `/moverm` now opens a configuration window with a Y-coordinate box, a "hide when collapsed" checkbox and a strata picker. `/moverm reset` restores every setting to the game's defaults, including the config window's own position (the window stays open, move mode stays on); any other input opens the window.

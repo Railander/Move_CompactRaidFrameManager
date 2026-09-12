@@ -1,6 +1,6 @@
 # Move Raid Manager
 
-Super lightweight addon that moves, autohides and re-stratas the default raid manager (the little panel at the top left of the screen), on every version of the game. Type `/moverm` in chat to open the configuration window.
+Super lightweight addon that moves (vertically), autohides and re-stratas the default raid manager (the little panel at the top left of the screen), on every version of the game. Type `/moverm` in chat to open the configuration window.
 
 ## Commands
 
@@ -18,7 +18,7 @@ Any other input opens the window as well. The raid frames themselves are never m
 
 ## Compatibility
 
-Works on Modern, Classic Era, Seasonal, Hardcore, TBC, Wrath, Cataclysm and Mists.
+Works on Modern, Classic Era, TBC, Wrath, Cataclysm and Mists.
 
 ## Links
 

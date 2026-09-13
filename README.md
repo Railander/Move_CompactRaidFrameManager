@@ -18,12 +18,12 @@ Any other input opens the window as well. The raid frames themselves are never m
 
 ## Compatibility
 
-World of Warcraft: Midnight (12.1.0)
-World of Warcraft: Mists of Pandaria (5.5.4)
-World of Warcraft: Cataclysm (4.4.0)
-World of Warcraft: Wrath of the Lich King (3.4.3)
-World of Warcraft: The Burning Crusade (2.5.6)
-World of Warcraft: Classic Era (1.15.9)
+- World of Warcraft: Midnight (12.1.0)
+- World of Warcraft: Mists of Pandaria (5.5.4)
+- World of Warcraft: Cataclysm (4.4.0)
+- World of Warcraft: Wrath of the Lich King (3.4.3)
+- World of Warcraft: The Burning Crusade (2.5.6)
+- World of Warcraft: Classic Era (1.15.9)
 
 ## Links
 

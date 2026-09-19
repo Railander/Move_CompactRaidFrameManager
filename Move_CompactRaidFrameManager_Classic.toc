@@ -1,4 +1,4 @@
-## Interface: 40400
+## Interface: 11509, 20506, 30403, 40400, 50504
 ## Version: @project-version@
 ## Title: Move Raid Manager
 ## Notes: Super lightweight addon that moves/autohides the default CompactRaidFrameManager, type /moverm for instructions.

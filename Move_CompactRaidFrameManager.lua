@@ -281,7 +281,7 @@ end
 -- re-anchors the manager on expand/collapse (traced across the whole 12.1
 -- tree), and the toggle post-hooks below call this right after, so the
 -- offset survives with no override of Blizzard's methods.
-	local function MoveRM_ApplyPosition()
+local function MoveRM_ApplyPosition()
 	if not db then
 		return;
 	end
@@ -529,8 +529,6 @@ end
 
 -- Tall-version preview heights, one per client family (the toggle buttons
 -- tell them apart at runtime: a lone toggleButton is classic, the
--- Tall-version preview heights, one per client family (the toggle buttons
--- tell them apart at runtime: a lone toggleButton is classic, the
 -- back/forward pair is modern). Blizzard resizes the manager itself to fit
 -- the options flow, so the party-leader frame height is derivable from the
 -- dumped UI code with zero live state -- no learning, no persistence, the
@@ -561,7 +559,8 @@ end
 -- (party-leads BG 222x344: no room for DIV>3 in either era). So DIV=0,
 -- padding 20, and LBL=13: the font-metrics 12 read 1px under live (owner
 -- measured, 2026-09-20), so the label carries the live-calibrated 13.
--- Rounded DOWN by policy: a 1-2px under-preview parks invisibly low,
+-- Rounded to nearest at the boundary: a 1-2px under-preview parks
+-- invisibly low,
 -- yellow that remains is a visible lie -- and the owner measured ~5px over
 -- at 364, matching DIV~3+LBL~14 (17) vs true ~12 word for word.
 -- Cross-checks: raid-lead math from the same rows gives ~472, matching the
@@ -688,7 +687,7 @@ MoveRM_DragUpdate = function()
 	end
 	local cy = cyRaw / scale;
 	db.y = MoveRM_Round2(cy - MoveRM_grabDY - ph);
-		MoveRM_ApplyPosition(); -- re-asserts over the stock re-anchor
+	MoveRM_ApplyPosition(); -- re-asserts over the stock re-anchor
 	MoveRM_SyncMoveBox();
 	if refreshWindow then
 		refreshWindow(); -- the Y box updates live while dragging

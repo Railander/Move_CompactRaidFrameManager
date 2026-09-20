@@ -8,6 +8,7 @@ manual-changelog: CHANGELOG.md
 ignore:
     - LICENSE
     - README.md
+    - preview.gif
     - .gitignore
     - .gitattributes
     - tests

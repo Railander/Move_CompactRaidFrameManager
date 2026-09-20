@@ -1,7 +1,7 @@
 # Move Raid Manager Changelog
 
 ## v2.3.1
-- Fixed CurseForge packaging: the Forever interface rides its own setup file again instead of sharing the Mainline one (the packager rejects mixed game types in a single `-Mainline.toc`). Nothing changes in game.
+- Fixed: the Forever version installs correctly again. Nothing changes in game.
 
 ## v2.3.0
 - The "hide when collapsed" checkbox is now a Hide picker: `never` keeps the manager fully visible (the default), `when cursor away` fades it out while it is collapsed and the cursor is elsewhere (hovering brings it back), `always` hides it at all times, even on hover. Your existing fade choice carries over automatically.
@@ -9,7 +9,7 @@
 - Each row has a little info icon beside it — hover it for a tooltip explaining that row.
 - The window now sizes its dropdowns from their entries and centers every row, so all the controls line up.
 - Move mode works outside groups now (the drag surface no longer depends on the hidden toggle strip), and a yellow box below the green one previews the taller leader/assist version — a fixed preview derived from Blizzard's own panel layout, shown immediately even solo on a fresh install, draggable like the rest.
-- The download now ships one setup file per game family (Classic, Mainline and Forever) instead of one per expansion — nothing changes in game.
+- The download is now organized by game family (Classic, Mainline and Forever) instead of by expansion — nothing changes in game.
 
 ## v2.2.0
 - The manager now works in World of Warcraft: Forever (beta).

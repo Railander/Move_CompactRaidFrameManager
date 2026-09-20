@@ -4,17 +4,18 @@ Super lightweight addon that moves (vertically), autohides and re-stratas the de
 
 ## Commands
 
-- `/moverm` — open the configuration window
-- `/moverm reset` — restore every setting to the game's defaults
+- `/moverm` — toggle the configuration window open/closed
+- `/moverm reset` — restore every setting to the game's defaults (the window stays open, move mode stays on)
 
-Any other input opens the window as well. The raid frames themselves are never moved, faded or re-strataed by it — only the manager is.
+Any other input toggles it too (opens it when closed). The raid frames themselves are never moved, faded or re-strataed by it — only the manager is.
 
 ## The config window
 
-- **move manager** — turn on move mode, then drag the manager itself up and down; a green box marks its exact spot (even where it would sit while hidden), with the manager overlaid on top. The expand/collapse toggle stays clickable while moving — and can itself be dragged to move. Closing the window leaves move mode.
+- **move manager** — turn on move mode, then drag the manager itself up and down; a green box marks its exact spot (even where it would sit while hidden), with the manager overlaid on top. A yellow box below it previews the taller leader/assist version (a fixed preview derived from Blizzard's own panel layout, so it shows immediately -- even solo on a fresh install). The expand/collapse toggle stays clickable while moving — and can itself be dragged to move. Closing the window leaves move mode.
 - **Y** — move the manager vertically, with a box for exact values (or drag it in move mode)
-- **hide when collapsed** — fade the manager out while it is collapsed; hovering it brings it back
-- **Strata** — change the manager's strata; it starts preselected on the game's own value
+- **Hide** — `never` keeps the manager fully visible, `when cursor away` fades it out while it is collapsed and the cursor is elsewhere (hovering brings it back), `always` hides it at all times, even on hover; `never` is the default
+- **Strata** — change the manager's strata, shown as 2–9; it starts preselected on the game's own value
+- **info icons** — hovering the little icon beside each row explains that row
 
 ## Compatibility
 

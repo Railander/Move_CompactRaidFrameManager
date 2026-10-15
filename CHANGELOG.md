@@ -1,5 +1,8 @@
 # Move Raid Manager Changelog
 
+## v2.3.2
+- The manager now works in World of Warcraft: Midnight (12.1.5). Nothing changes in game.
+
 ## v2.3.1
 - Fixed: the Forever version installs correctly again. Nothing changes in game.
 

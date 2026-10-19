@@ -1,6 +1,6 @@
 # Move Raid Manager Changelog
 
-## Unreleased
+## v2.3.4
 - The manager (in move mode) and the configuration window now move the moment you press the mouse button, with no dead zone before they start following the cursor. The expand/collapse strip still needs a short drag first, so a plain click on it keeps working.
 
 ## v2.3.3

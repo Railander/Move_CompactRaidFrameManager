@@ -465,18 +465,22 @@ end
 -- fight the manager's own anchors (each apply pulls the box, each box read
 -- would feed back into the manager). Instead the box is ONLY ever
 -- manager-driven and the manager is ONLY ever cursor-driven, so there is a
--- single control loop with nothing to fight.
+-- single control loop with nothing to fight. The grab starts on the press
+-- itself (no drag threshold), so the manager follows from the first pixel.
 local function MoveRM_MakeDragInput(name)
 	local input = CreateFrame("Frame", name, UIParent);
 	input:SetFrameStrata("TOOLTIP");
 	input:SetFrameLevel(100);
 	input:EnableMouse(true);
-	input:RegisterForDrag("LeftButton");
-	input:SetScript("OnDragStart", function(self)
-		MoveRM_BeginDrag(self);
+	input:SetScript("OnMouseDown", function(self, button)
+		if button == "LeftButton" then
+			MoveRM_BeginDrag(self);
+		end
 	end);
-	input:SetScript("OnDragStop", function(self)
-		MoveRM_EndDrag(self);
+	input:SetScript("OnMouseUp", function(self, button)
+		if button == "LeftButton" then
+			MoveRM_EndDrag(self);
+		end
 	end);
 	input:Hide();
 	return input;
@@ -791,12 +795,13 @@ local function MoveRM_BuildWindow()
 	options:SetSize(308, 158);
 	options:SetMovable(true);
 	options:EnableMouse(true);
-	options:RegisterForDrag("LeftButton");
 	options:SetClampedToScreen(true);
-	options:SetScript("OnDragStart", function(self)
-		self:StartMoving(); -- own frame: always servable
-	end);
-	options:SetScript("OnDragStop", function(self)
+	-- the window moves from the press itself (no drag threshold)
+	options:SetScript("OnMouseUp", function(self, button)
+		if button ~= "LeftButton" or not self.moving then
+			return;
+		end
+		self.moving = false;
 		self:StopMovingOrSizing();
 		if db then
 			local pw, ph = UIParent:GetSize();
@@ -817,9 +822,13 @@ local function MoveRM_BuildWindow()
 
 	-- clicking anywhere outside an edit box (on the window or on the world)
 	-- gives keyboard focus back so the game chat works again
-	options:SetScript("OnMouseDown", function()
+	options:SetScript("OnMouseDown", function(self, button)
 		if options.yBox then
 			options.yBox:ClearFocus();
+		end
+		if button == "LeftButton" then
+			self.moving = true;
+			self:StartMoving(); -- own frame: always servable
 		end
 	end);
 	if WorldFrame then
@@ -900,7 +909,11 @@ local function MoveRM_BuildWindow()
 			refreshWindow();
 		end
 	end);
-	options:SetScript("OnHide", function()
+	options:SetScript("OnHide", function(self)
+		-- hidden mid-move (Escape): finish the move so the spot is saved
+		if self.moving then
+			self:GetScript("OnMouseUp")(self, "LeftButton");
+		end
 		if MoveRM_moveModeOn then
 			MoveRM_SetMoveMode(false); -- leaving the window also leaves move mode
 		end
@@ -1094,14 +1107,18 @@ local function MoveRM_InstallHooks()
 	-- shows) the visible sliver would otherwise not drag. A plain press still
 	-- does nothing here (the body has no click action), and children keep
 	-- precedence -- buttons, dropdowns and the resize handle behave stock.
-	manager:RegisterForDrag("LeftButton");
-	-- SetScript, not HookScript: the game sets no drag scripts here, so
-	-- there is nothing to chain onto
-	manager:SetScript("OnDragStart", function(self)
-		MoveRM_BeginDrag(self);
+	-- Like the move input, the grab starts on the press itself.
+	-- SetScript, not HookScript: the game sets no mouse scripts on the
+	-- manager itself, so there is nothing to chain onto
+	manager:SetScript("OnMouseDown", function(self, button)
+		if button == "LeftButton" then
+			MoveRM_BeginDrag(self);
+		end
 	end);
-	manager:SetScript("OnDragStop", function(self)
-		MoveRM_EndDrag(self);
+	manager:SetScript("OnMouseUp", function(self, button)
+		if button == "LeftButton" then
+			MoveRM_EndDrag(self);
+		end
 	end);
 	for _, key in ipairs({ "toggleButton", "toggleButtonBack", "toggleButtonForward" }) do
 		local button = manager[key];
@@ -1127,8 +1144,10 @@ local function MoveRM_InstallHooks()
 		-- dual-purpose strip: a plain press runs the stock click above
 		-- natively, while a press-and-move drags the manager (move mode
 		-- only). RegisterForDrag never blocks clicks -- the client still
-		-- fires OnClick for a press without movement. SetScript for the
-		-- same reason as the manager body above.
+		-- fires OnClick for a press without movement. The strip keeps the
+		-- client's drag threshold (unlike the body and the move input): a
+		-- press must stay a clean click. SetScript for the same reason as
+		-- the manager body above.
 		button:RegisterForDrag("LeftButton");
 		button:SetScript("OnDragStart", function(self)
 			MoveRM_BeginDrag(self);

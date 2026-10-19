@@ -1,5 +1,8 @@
 # Move Raid Manager Changelog
 
+## Unreleased
+- The manager (in move mode) and the configuration window now move the moment you press the mouse button, with no dead zone before they start following the cursor. The expand/collapse strip still needs a short drag first, so a plain click on it keeps working.
+
 ## v2.3.3
 - Fixed: on every version except Midnight and Forever, the `always` Hide setting now also hides the expanded panel's buttons, not just its background.
 - Pressing Escape in the Y box now cancels the edit and shows the saved value again.

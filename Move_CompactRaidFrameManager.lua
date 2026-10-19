@@ -10,8 +10,9 @@
 --     reparented UNDER the manager while the raid frames sit in their default
 --     spot next to it (moving the raid frames away in edit mode breaks that
 --     link), so the fade targets the manager's own artwork and toggle button
---     instead -- correct either way, since that is all that is visible while
---     collapsed
+--     instead (plus the options panel for "always", the one mode that hides
+--     an expanded manager) -- correct either way, since the raid frames
+--     never live inside those
 -- The game re-anchors the manager on every expand/collapse, and only there;
 -- post-hooks on the toggle buttons re-apply the saved vertical offset after
 -- those re-anchors, so the offset survives with no override of the manager's
@@ -24,23 +25,15 @@
 -- until one is chosen, and changing it never touches the raid frames' own
 -- strata.
 --
--- Midnight (12.x) gate discipline, retail flavor only: there is none. Tainted
--- calls on secret-clean objects serve under any restriction state
--- (live-verified 2026-09-12, all six types forced: drags, settings, strata
--- writes, installs, all clean), and nothing this addon touches can become
--- secret-marked (it ingests no unit/combat/aura data; Blizzard doesn't mark
--- chrome). So every op below just attempts -- no flag checks, no mark checks,
--- no read-back verification, no queues. Widget builds run inside pcall
--- containment (a missing template must not break the manager), which is
--- crash-safety, not gating. If the engine ever refuses,
--- it errors LOUDLY (Bugsack, not silence), which is exactly what we want: a
--- silent queue would hide the bug forever, an error gets reported and fixed.
--- The only guards left are crash-safety (nil results abort geometry) and
--- correctness (the position early-out keeps the default Y from touching
--- Blizzard's anchors at all). Classic flavors run the same code.
--- Safe everywhere: SetAlpha, FontString:SetText, Show/Hide, db work. Chat
--- tutorial prints best-effort always (a swallowed line under Chat lockdown is
--- harmless -- it is never load-bearing).
+-- Midnight (12.x) combat restrictions: tainted calls on secret-clean objects
+-- serve under any restriction state, and nothing this addon touches can
+-- become secret-marked (it ingests no unit/combat/aura data). So every op
+-- below just attempts -- no flag checks, no queues. If the engine ever
+-- refuses, it errors loudly instead of failing silently. Widget builds run
+-- inside pcall (a missing template must not break the manager); the only
+-- other guards are crash-safety (nil reads abort geometry) and correctness
+-- (the position early-out keeps the default Y from touching the game's
+-- anchors at all). Classic flavors run the same code.
 
 local ADDON_NAME = "Move_CompactRaidFrameManager";
 
@@ -54,7 +47,7 @@ if not (manager and container) then
 	return;
 end
 
--- ingame instructions, in the same scheme as the other Move_* addons
+-- first-run instructions
 local exitColor = "|r";
 local colorOrange = "|cFFDF9F1F";
 local function MoveRM_instructions()
@@ -111,6 +104,7 @@ local options, refreshWindow; -- config window and its refresher, built below
 -- them: Lua upvalues bind at closure creation, so a later `local` would leave
 -- earlier paths writing to a same-named global instead.
 local MoveRM_stateLoaded = false; -- db backfilled (pure Lua, always runs)
+local MoveRM_addonLoadedSeen = false; -- our own ADDON_LOADED consumed (no re-subscribe after)
 local MoveRM_hooksInstalled = false; -- post-hooks attempted once (HookScript chains)
 local MoveRM_captured = false; -- stock captured once (recapturing would adopt our moves)
 local MoveRM_moveModeOn = false; -- move mode: the green box + drag input are shown
@@ -202,6 +196,12 @@ local function MoveRM_SetAlpha(alpha)
 	for _, region in ipairs(fadeRegions) do
 		region:SetAlpha(alpha);
 	end
+	-- classic options panel (expanded only, hosts no raid frames): faded
+	-- for "always" alone -- the other modes never hide an expanded manager,
+	-- so it stays untouched at full alpha there
+	if manager.displayFrame then
+		manager.displayFrame:SetAlpha(db.hide == 3 and 0 or 1);
+	end
 end
 
 -- Hover covers the manager body AND its toggle strip: sliding from the body
@@ -289,8 +289,9 @@ local function MoveRM_ApplyPosition()
 	if not point then
 		return;
 	end
-	if y == db.y then
-		-- already exactly there: leave Blizzard's anchor completely alone
+	if y and MoveRM_Round2(y) == db.y then
+		-- already there (float32 layout dust included): leave the game's
+		-- anchor completely alone
 		return;
 	end
 	manager:ClearAllPoints();
@@ -336,9 +337,8 @@ local function MoveRM_Reset()
 		return;
 	end
 	db.y, db.hide = MoveRM_Round2(stockY), 1;
-	db.tallExtra = nil; -- scrapped learn-era key: the ghost is deterministic now (see the preview heights)
-	db.fade = nil; -- checkbox-era key, dropped by the hide migration
-	db.side, db.mirror = nil, nil; -- scrapped beta keys, never shipped (see Sanitize)
+	-- obsolete keys (see Sanitize)
+	db.tallExtra, db.fade, db.side, db.mirror = nil, nil, nil, nil;
 	db.win = { x = 0, y = 0 };
 	if MoveRM_captured then
 		MoveRM_SetStrata(stockStrataIndex);
@@ -402,11 +402,9 @@ local function MoveRM_Sanitize(dbt)
 			dbt.strata = nil;
 		end
 	end
-	-- scrapped learn-era key (tallExtra heights from testing): drop it so
-	-- old tables come back clean -- the ghost is deterministic now
+	-- obsolete keys from pre-release builds: drop them so old tables come
+	-- back clean
 	dbt.tallExtra = nil;
-	-- scrapped beta keys (side/mirror docks never shipped): drop them so
-	-- tables from testing come back clean
 	dbt.side = nil;
 	dbt.mirror = nil;
 	if type(dbt.win) ~= "table" then
@@ -417,7 +415,7 @@ local function MoveRM_Sanitize(dbt)
 end
 
 -- ----------------------------------------------------------------------------
--- move mode: drag the manager vertically, following MFC's drag proxy pattern
+-- move mode: drag the manager vertically through a drag proxy
 -- ----------------------------------------------------------------------------
 -- Entering move mode shows a green 50% box exactly over the manager's rect at
 -- a lower strata (BACKGROUND, so the manager overlays it) plus a transparent
@@ -426,10 +424,21 @@ end
 -- when the manager itself is hidden (not in group) -- where the manager would
 -- fit if it was there. The math is cursor-driven, never read back from the
 -- box: the box follows the manager, so reading it would feed our own movement
--- back into the next update and run away (see MFC). The OnUpdate script only
+-- back into the next update and run away. The OnUpdate script only
 -- exists while a drag is active and is removed on release, so there is no
 -- per-frame cost outside of it. Vertical only: the manager's X always belongs
 -- to its collapsed/expanded stock anchor.
+
+-- Cursor Y in UI units, or nil when unreadable: GetCursorPosition returns
+-- screen pixels, and the manager lives under UIParent, so divide by its
+-- effective scale (at scale 1 this divides by 1).
+local function MoveRM_CursorY()
+	local _, cy = GetCursorPosition();
+	if cy == nil then
+		return nil;
+	end
+	return cy / UIParent:GetEffectiveScale();
+end
 
 -- Best-effort OnUpdate detach on our own input frame: always safe.
 MoveRM_DetachDrag = function()
@@ -438,57 +447,50 @@ MoveRM_DetachDrag = function()
 	end
 end;
 
+-- a mouse-transparent 50% color box at the bottom strata
+local function MoveRM_MakeBox(name, r, g, b)
+	local box = CreateFrame("Frame", name, UIParent);
+	box:SetFrameStrata("BACKGROUND");
+	box:SetFrameLevel(1);
+	box:EnableMouse(false);
+	local tex = box:CreateTexture(nil, "BACKGROUND");
+	tex:SetColorTexture(r, g, b, 0.5);
+	tex:SetAllPoints();
+	box:Hide();
+	return box;
+end
+
+-- a transparent drag input at the top strata, so grabs land.
+-- No StartMoving/StopMovingOrSizing anywhere: the built-in mover would
+-- fight the manager's own anchors (each apply pulls the box, each box read
+-- would feed back into the manager). Instead the box is ONLY ever
+-- manager-driven and the manager is ONLY ever cursor-driven, so there is a
+-- single control loop with nothing to fight.
+local function MoveRM_MakeDragInput(name)
+	local input = CreateFrame("Frame", name, UIParent);
+	input:SetFrameStrata("TOOLTIP");
+	input:SetFrameLevel(100);
+	input:EnableMouse(true);
+	input:RegisterForDrag("LeftButton");
+	input:SetScript("OnDragStart", function(self)
+		MoveRM_BeginDrag(self);
+	end);
+	input:SetScript("OnDragStop", function(self)
+		MoveRM_EndDrag(self);
+	end);
+	input:Hide();
+	return input;
+end
+
 local function MoveRM_BuildMoveUI()
 	if MoveRM_moveBox then
 		return;
 	end
-	MoveRM_moveBox = CreateFrame("Frame", "Move_CompactRaidFrameManagerMoveBox", UIParent);
-	MoveRM_moveBox:SetFrameStrata("BACKGROUND");
-	MoveRM_moveBox:SetFrameLevel(1);
-	MoveRM_moveBox:EnableMouse(false);
-	local tex = MoveRM_moveBox:CreateTexture(nil, "BACKGROUND");
-	tex:SetColorTexture(0, 1, 0, 0.5);
-	tex:SetAllPoints();
-	MoveRM_moveBox:Hide();
-	MoveRM_moveInput = CreateFrame("Frame", "Move_CompactRaidFrameManagerMoveInput", UIParent);
-	MoveRM_moveInput:SetFrameStrata("TOOLTIP");
-	MoveRM_moveInput:SetFrameLevel(100);
-	MoveRM_moveInput:EnableMouse(true);
-	MoveRM_moveInput:RegisterForDrag("LeftButton");
-	-- No StartMoving/StopMovingOrSizing anywhere: the built-in mover would
-	-- fight the manager's own anchors (each apply pulls the box, each box
-	-- read would feed back into the manager). Instead the box is ONLY ever
-	-- manager-driven and the manager is ONLY ever cursor-driven, so there is
-	-- a single control loop with nothing to fight.
-	MoveRM_moveInput:SetScript("OnDragStart", function(self)
-		MoveRM_BeginDrag(self);
-	end);
-	MoveRM_moveInput:SetScript("OnDragStop", function(self)
-		MoveRM_EndDrag(self);
-	end);
-	MoveRM_moveInput:Hide();
-	-- the tall-version ghost (see SyncMoveBox): yellow, mouse-transparent
-	-- like the green box, with its own drag input above it
-	MoveRM_moveGhost = CreateFrame("Frame", "Move_CompactRaidFrameManagerMoveGhost", UIParent);
-	MoveRM_moveGhost:SetFrameStrata("BACKGROUND");
-	MoveRM_moveGhost:SetFrameLevel(1);
-	MoveRM_moveGhost:EnableMouse(false);
-	local ghostTex = MoveRM_moveGhost:CreateTexture(nil, "BACKGROUND");
-	ghostTex:SetColorTexture(1, 1, 0, 0.5);
-	ghostTex:SetAllPoints();
-	MoveRM_moveGhost:Hide();
-	MoveRM_moveGhostInput = CreateFrame("Frame", "Move_CompactRaidFrameManagerMoveGhostInput", UIParent);
-	MoveRM_moveGhostInput:SetFrameStrata("TOOLTIP");
-	MoveRM_moveGhostInput:SetFrameLevel(100);
-	MoveRM_moveGhostInput:EnableMouse(true);
-	MoveRM_moveGhostInput:RegisterForDrag("LeftButton");
-	MoveRM_moveGhostInput:SetScript("OnDragStart", function(self)
-		MoveRM_BeginDrag(self);
-	end);
-	MoveRM_moveGhostInput:SetScript("OnDragStop", function(self)
-		MoveRM_EndDrag(self);
-	end);
-	MoveRM_moveGhostInput:Hide();
+	MoveRM_moveBox = MoveRM_MakeBox("Move_CompactRaidFrameManagerMoveBox", 0, 1, 0);
+	MoveRM_moveInput = MoveRM_MakeDragInput("Move_CompactRaidFrameManagerMoveInput");
+	-- the tall-version ghost (see SyncMoveBox): yellow, with its own input
+	MoveRM_moveGhost = MoveRM_MakeBox("Move_CompactRaidFrameManagerMoveGhost", 1, 1, 0);
+	MoveRM_moveGhostInput = MoveRM_MakeDragInput("Move_CompactRaidFrameManagerMoveGhostInput");
 end
 
 -- Shared drag endpoints: the move input AND the toggle-strip buttons both
@@ -503,15 +505,11 @@ MoveRM_BeginDrag = function(self)
 	-- capture where the cursor grabbed relative to the manager's anchor:
 	-- db.y already IS the anchor's Y in UI units, so the grab is exact
 	-- and the manager cannot jump by a single pixel, whatever the scale
-	local _, ph = UIParent:GetSize();
-	-- GetCursorPosition returns screen pixels: scale into UI units (at
-	-- scale 1 this divides by 1, so the math is unchanged there)
-	local scale = (UIParent.GetEffectiveScale and UIParent:GetEffectiveScale()) or 1;
-	local _, cyRaw = GetCursorPosition();
-	if cyRaw == nil then
+	local cy = MoveRM_CursorY();
+	if cy == nil then
 		return; -- cursor unreadable: refuse the grab without touching anything
 	end
-	local cy = cyRaw / scale;
+	local _, ph = UIParent:GetSize();
 	MoveRM_grabDY = cy - (ph + db.y);
 	MoveRM_moveDragging = true;
 	if MoveRM_moveInput then
@@ -527,62 +525,23 @@ MoveRM_EndDrag = function(self)
 	MoveRM_DetachDrag();
 end
 
--- Tall-version preview heights, one per client family (the toggle buttons
--- tell them apart at runtime: a lone toggleButton is classic, the
--- back/forward pair is modern). Blizzard resizes the manager itself to fit
--- the options flow, so the party-leader frame height is derivable from the
--- dumped UI code with zero live state -- no learning, no persistence, the
--- ghost shows on a fresh install, solo, first session. Target is the PARTY
--- leader (the 5-man panel), not the raid leader: the constants must match
--- the layout the owner actually parks against -- a raid-lead MAX (prior
--- 480) previews 2-3x the party overflow solo and leaves ~110px of yellow
--- below an expanded party-lead box. Derivation (12.1.0 dump, flow function
--- byte-identical on GitHub master and in 1.60.1/1.15.9/2.5.6/5.5.4; no
--- custom flow spacing anywhere, so every line break adds exactly the row
--- height; independently verified by a third-party sim executing the real
--- Blizzard code against retail: party-regular usedY=255 -> H=275 and
--- party-lead usedY=327 -> H=347 with stub-zero divider/label -- both EXACT):
--- MODERN (Mainline UpdateOptionsFlowContainer, party leader: no
--- filterOptions; five 40x40 buttons -- difficulty, editMode, readyCheck,
--- rolePoll, countdown -- stride 4 gives rows of 4+1 plus ONE horizontal
--- divider): usedY = 48 top offset + 40 + DIV + 40 + 10 + 99 raidMarkers
--- (XML 222x99) + 5 + LBL RestrictPingsLabel (158x0 FontString: one
--- GameFontNormalLeft line -- FRIZQT 12px, no spacing, taken at a tight 12)
--- + 2 + 25 RestrictPingsDropdown (WowStyle1DropdownTemplate 120x25) + 5 +
--- 53 BottomButtons (XML 160x53); height = usedY + 20 = 360, pixel by pixel:
--- 48+40+0+40+10+99+5+13+2+25+5+53+20 = 360. Every term pinned: the 327
--- subtotal (everything but DIV/LBL/padding) reproduces a third-party probe
--- EXACTLY (sim executing the real Blizzard code: party-lead usedY=327 ->
--- H=347 with its stub-zero divider/label), which simultaneously proves the
--- divider atlas resolves to ~0 despite the object sitting in-flow (its
--- terms would otherwise overshoot the probe) and bounds old-era art
--- (party-leads BG 222x344: no room for DIV>3 in either era). So DIV=0,
--- padding 20, and LBL=13: the font-metrics 12 read 1px under live (owner
--- measured, 2026-09-20), so the label carries the live-calibrated 13.
--- Rounded to nearest at the boundary: a 1-2px under-preview parks
--- invisibly low,
--- yellow that remains is a visible lie -- and the owner measured ~5px over
--- at 364, matching DIV~3+LBL~14 (17) vs true ~12 word for word.
--- Cross-checks: raid-lead math from the same rows gives ~472, matching the
--- old 222x474 leads art -- the row model is sound.
--- CLASSIC (Classic/... UpdateOptionsFlowContainer, container =
--- displayFrame.optionsFlowContainer, 200 wide; party leader: no offset
--- reset outside the raid branch, so 0 fresh (post-raid without /reload the
--- stale 4 lingers -- RemoveAllObjects never clears offsets -- giving 199:
--- the clamp still shows none expanded, solo under-previews by 4, both
--- invisible in practice): usedY = 50 raidMarkers + 65
--- leaderOptions (200 wide, own lines) + 20 convertToRaid line (169x20
--- after a 20px indent) + 20 editMode/hiddenModeToggle line (85+85 side
--- by side) = 155; height = usedY + 40 = 195 exactly -- every term
--- XML-exact, no estimates. Same structure in all four classic dumps.
--- The ghost below shows tall MINUS the current box height (see SyncMoveBox),
--- so an expanded party-lead box (already tall) shows no ghost while a solo
--- box previews the exact lead reach. CAVEATS: a RAID leader/assist/member
--- layout is taller (raid-lead ~472) and clamps to no ghost -- parking a
--- raid panel needs manual margin, the preview covers party play exactly.
--- DRIFT RISK: a Blizzard row add/remove/resize or divider-art change
--- stale-dates the constants -- re-derive from UpdateOptionsFlowContainer
--- when the leader panel visibly changes.
+-- Tall-version preview heights, one per client family (a lone toggleButton
+-- is classic, the back/forward pair is modern). The game resizes the manager
+-- to fit its options flow, so the PARTY-leader panel height follows from the
+-- game's own UpdateOptionsFlowContainer with zero live state: the ghost shows
+-- on a fresh install, solo, first session.
+-- MODERN (party leader: no filter options; five 40x40 buttons in rows of
+-- 4+1, one divider that resolves to ~0 height): 48 top offset + 40 + 0 + 40
+-- + 10 + 99 raid markers + 5 + 13 restrict-pings label + 2 + 25 dropdown + 5
+-- + 53 bottom buttons + 20 padding = 360.
+-- CLASSIC (200 wide): 50 raid markers + 65 leader options + 20 convert-to-
+-- raid line + 20 edit-mode/hidden-mode line + 40 padding = 195. After a raid
+-- without a /reload the game keeps a stale 4px offset (199): invisible in
+-- practice, the clamp below still shows none expanded.
+-- The ghost shows tall MINUS the current box height (see SyncMoveBox), so an
+-- expanded party-lead box shows no ghost while a solo box previews the full
+-- reach. Raid layouts are taller (raid lead ~472) and clamp to no ghost.
+-- Re-derive both numbers if the game's leader panel visibly changes.
 local MoveRM_TALL_MODERN = 360;
 local MoveRM_TALL_CLASSIC = 195;
 
@@ -649,9 +608,8 @@ MoveRM_SyncMoveBox = function()
 	-- the window close exits it.
 	MoveRM_moveInput:ClearAllPoints();
 	local strip = manager.toggleButton or manager.toggleButtonBack or manager.toggleButtonForward;
-	-- the manager-shown check is the whole gate: Blizzard always shows
-	-- exactly one strip with the manager (Collapse/Expand swap them), so a
-	-- separate strip check buys nothing and the mock never Shows its strips
+	-- the manager-shown check is the whole gate: the game always shows
+	-- exactly one strip with the manager (Collapse/Expand swap them)
 	if strip and manager:IsShown() then
 		MoveRM_moveInput:SetPoint("TOPLEFT", manager, "TOPLEFT", 0, 0);
 		MoveRM_moveInput:SetPoint("BOTTOMLEFT", manager, "BOTTOMLEFT", 0, 0);
@@ -674,18 +632,15 @@ MoveRM_DragUpdate = function()
 		MoveRM_moveDragging = false;
 		return;
 	end
-	local _, ph = UIParent:GetSize();
-	-- screen pixels into UI units (see BeginDrag); scale 1 divides by 1
-	local scale = (UIParent.GetEffectiveScale and UIParent:GetEffectiveScale()) or 1;
-	local _, cyRaw = GetCursorPosition();
-	if cyRaw == nil then
+	local cy = MoveRM_CursorY();
+	if cy == nil then
 		-- cursor unreadable mid-drag: end the gesture without persisting
 		-- anything further (db keeps the last good spot)
 		MoveRM_moveDragging = false;
 		MoveRM_DetachDrag();
 		return;
 	end
-	local cy = cyRaw / scale;
+	local _, ph = UIParent:GetSize();
 	db.y = MoveRM_Round2(cy - MoveRM_grabDY - ph);
 	MoveRM_ApplyPosition(); -- re-asserts over the stock re-anchor
 	MoveRM_SyncMoveBox();
@@ -744,18 +699,12 @@ local function MoveRM_MakeLabel(parent, text, fontObject, point, relativeTo, rel
 	return fs;
 end
 
--- Info icons: the spellbook's hi-res "i" (Interface\Common\Help-I), stretched
--- full-canvas to 16px -- the GuildRewards-tutorial-button pattern. Proven
--- across every dumped flavor (referenced in the 1.15.9/2.5.6/5.5.4 Classic
--- and 12.1.0/1.60.1 Mainline UI dumps); residual: 3.4.3/4.4.0 undumped.
--- Three shapes failed live first and stay documented in-code so nobody
--- retries them: UIPanelInfoButton shows its texture UNSIZED (native pixels
--- overflowing its 16px button = blurry crop); FriendsFrame's InformationIcon
--- full-stretched is equally soft (vanilla-era source art, crisp only at
--- MoneyFrame's 13px -- while Help-I is modern art authored for 46px, so it
--- downscales sharp); the spellbook's TrackingBorder ring art sits off-center
--- in its own canvas (HelpPlate compensates +12/-13 at 64px -- unknowable
--- blind at 16px, read as a small top-left circle).
+-- Info icons: the spellbook's hi-res "i" (Interface\Common\Help-I, present in
+-- the game data of every flavor), stretched full-canvas to 16px. Modern art
+-- authored for 46px, so it downscales sharp -- unlike UIPanelInfoButton
+-- (texture shown unsized: a blurry crop), FriendsFrame's InformationIcon
+-- (vanilla-era art, soft above 13px) or the tracking-border ring (off-center
+-- in its own canvas).
 -- Deliberately a mouse-enabled Frame, not a Button: buttons press/highlight
 -- on hover while this one does nothing on click. One icon sits between each
 -- label and its control (labels are FontStrings, which never receive mouse
@@ -822,7 +771,10 @@ local function MoveRM_MakeEditBox(parent, width, maxLetters, point, relativeTo, 
 	box:SetMaxLetters(maxLetters);
 	box:SetJustifyH("CENTER");
 	box:SetScript("OnEscapePressed", function(self)
-		self:ClearFocus(); -- own frame: always servable
+		self:ClearFocus();
+		if refreshWindow then
+			refreshWindow(); -- cancel: unsubmitted text reverts to the saved value
+		end
 	end);
 	box:SetScript("OnEnterPressed", function(self)
 		self:ClearFocus();
@@ -997,93 +949,60 @@ local function MoveRM_StyleDropdown(button, label, rowTop, entries)
 	button.MoveRM_label = MoveRM_MakeLabel(options, label, "GameFontNormalLarge", "RIGHT", button, "LEFT", -MoveRM_LABEL_GAP, 0);
 end
 
-local function MoveRM_BuildStrataPicker()
+-- Both pickers (hide and strata) follow one picker/fallback split: a
+-- dropdown where the menu system exists, a cycling button where it does not.
+-- spec: key (options field), label, rowTop, labels (display texts, index =
+-- db value), get/set (db readers/appliers). Only real values are listed --
+-- the game default is preselected (backfilled), so no placeholder entry.
+local function MoveRM_PickerChanged(spec, value)
+	spec.set(value); -- db already correct, frame follows
+	if refreshWindow then
+		refreshWindow();
+	end
+end
+
+local function MoveRM_BuildPicker(spec)
 	-- build into a local: SetupMenu is the fallible step (missing menu
 	-- system), and publishing only on success lets EnsureInit fall back to
 	-- the cycling button instead of leaving a dead dropdown behind
 	local btn = CreateFrame("DropdownButton", nil, options, "WowStyle1DropdownTemplate");
-	MoveRM_StyleDropdown(btn, "Strata", -120, MoveRM_STRATA_LABELS);
+	MoveRM_StyleDropdown(btn, spec.label, spec.rowTop, spec.labels);
 	btn:SetupMenu(function(_, rootDescription)
 		if not db then
 			return;
 		end
-		-- the live game default is preselected (backfilled at capture), so
-		-- the list holds real values only -- no placeholder entry
-		for i in ipairs(STRATAS) do
-			rootDescription:CreateRadio(MoveRM_StrataLabel(i),
+		for i, text in ipairs(spec.labels) do
+			rootDescription:CreateRadio(text,
 				function(data)
-					return db.strata == data;
+					return spec.get() == data;
 				end,
 				function(data)
-					MoveRM_SetStrata(data); -- db already correct, frame follows
-					if refreshWindow then
-						refreshWindow();
-					end
+					MoveRM_PickerChanged(spec, data);
 				end, i);
 		end
 	end);
-	options.strataBtn = btn;
+	options[spec.key] = btn;
 end
 
-local function MoveRM_BuildStrataFallback()
+local function MoveRM_BuildPickerFallback(spec)
 	local btn = CreateFrame("Button", nil, options, "UIPanelButtonTemplate");
-	MoveRM_StyleDropdown(btn, "Strata", -120, MoveRM_STRATA_LABELS);
+	MoveRM_StyleDropdown(btn, spec.label, spec.rowTop, spec.labels);
 	btn:SetScript("OnClick", function()
 		if not db then
 			return;
 		end
-		-- cycle the real values only, wrapping around (never a placeholder)
-		MoveRM_SetStrata((db.strata or 0) % MAX_STRATA + 1); -- db already correct
-		if refreshWindow then
-			refreshWindow();
-		end
+		-- cycle the real values only, wrapping around
+		MoveRM_PickerChanged(spec, (spec.get() or 0) % #spec.labels + 1);
 	end);
-	options.strataBtn = btn;
+	options[spec.key] = btn;
 end
 
--- the hide picker needs the menu system too, so it follows the same
--- picker/fallback split as strata: a dropdown where the menu exists, a
--- cycling button where it does not
-local function MoveRM_BuildHidePicker()
-	-- same local-build discipline as the strata picker: a missing SetupMenu
-	-- must leave nothing behind so the fallback below still runs
-	local btn = CreateFrame("DropdownButton", nil, options, "WowStyle1DropdownTemplate");
-	MoveRM_StyleDropdown(btn, "Hide", -84, HIDES);
-	btn:SetupMenu(function(_, rootDescription)
-		if not db then
-			return;
-		end
-		for i, name in ipairs(HIDES) do
-			rootDescription:CreateRadio(name,
-				function(data)
-					return db.hide == data;
-				end,
-				function(data)
-					MoveRM_SetHide(data); -- db already correct, frame follows
-					if refreshWindow then
-						refreshWindow();
-					end
-				end, i);
-		end
-	end);
-	options.hideBtn = btn;
-end
-
-local function MoveRM_BuildHideFallback()
-	local btn = CreateFrame("Button", nil, options, "UIPanelButtonTemplate");
-	MoveRM_StyleDropdown(btn, "Hide", -84, HIDES);
-	btn:SetScript("OnClick", function()
-		if not db then
-			return;
-		end
-		-- cycle never -> when cursor away -> always, wrapping around
-		MoveRM_SetHide((db.hide or 0) % MAX_HIDE + 1); -- db already correct
-		if refreshWindow then
-			refreshWindow();
-		end
-	end);
-	options.hideBtn = btn;
-end
+local MoveRM_PICKERS = {
+	{ key = "hideBtn", label = "Hide", rowTop = -84, labels = HIDES,
+		get = function() return db.hide; end, set = function(v) MoveRM_SetHide(v); end },
+	{ key = "strataBtn", label = "Strata", rowTop = -120, labels = MoveRM_STRATA_LABELS,
+		get = function() return db.strata; end, set = function(v) MoveRM_SetStrata(v); end },
+};
 
 -- Center the widest label+icon+control row in the window, then left-align
 -- every other control to that row's control edge. Labels right-anchor to
@@ -1131,16 +1050,12 @@ end
 -- and on slash)
 -- ----------------------------------------------------------------------------
 
--- Backfill the db from SavedVariables. Pure Lua table work only. Returns
--- false on a missing manager (inert before touching SavedVariables).
+-- Backfill the db from SavedVariables. Pure Lua table work only.
 -- Idempotent. The first-run tutorial prints best-effort, chat lockdown or
 -- not -- it is never load-bearing.
 local function MoveRM_LoadState()
 	if MoveRM_stateLoaded then
-		return true;
-	end
-	if not (manager and container) then
-		return false;
+		return;
 	end
 
 	local freshDB = _G[ADDON_NAME] == nil;
@@ -1156,7 +1071,6 @@ local function MoveRM_LoadState()
 		MoveRM_instructions();
 	end
 	MoveRM_stateLoaded = true;
-	return true;
 end
 
 
@@ -1181,11 +1095,8 @@ local function MoveRM_InstallHooks()
 	-- does nothing here (the body has no click action), and children keep
 	-- precedence -- buttons, dropdowns and the resize handle behave stock.
 	manager:RegisterForDrag("LeftButton");
-	-- SetScript stays (not HookScript): the conservative sealed variant since
-	-- the move-mode launch -- stock sets no drag scripts here, so HookScript
-	-- buys nothing. (A HookScript round-trip on 2026-09-20 proved nothing
-	-- either way: the reported failure tracked group state across both
-	-- variants, and the mock drives both identically.)
+	-- SetScript, not HookScript: the game sets no drag scripts here, so
+	-- there is nothing to chain onto
 	manager:SetScript("OnDragStart", function(self)
 		MoveRM_BeginDrag(self);
 	end);
@@ -1216,8 +1127,8 @@ local function MoveRM_InstallHooks()
 		-- dual-purpose strip: a plain press runs the stock click above
 		-- natively, while a press-and-move drags the manager (move mode
 		-- only). RegisterForDrag never blocks clicks -- the client still
-		-- fires OnClick for a press without movement. SetScript (not
-		-- HookScript) per the manager body above: the sealed variant.
+		-- fires OnClick for a press without movement. SetScript for the
+		-- same reason as the manager body above.
 		button:RegisterForDrag("LeftButton");
 		button:SetScript("OnDragStart", function(self)
 			MoveRM_BeginDrag(self);
@@ -1263,16 +1174,12 @@ MoveRM_EnsureInit = function()
 			refreshWindow = nil;
 		end
 	end
-	if options and not options.strataBtn then
-		pcall(MoveRM_BuildStrataPicker);
-		if not options.strataBtn then
-			pcall(MoveRM_BuildStrataFallback);
-		end
-	end
-	if options and not options.hideBtn then
-		pcall(MoveRM_BuildHidePicker);
-		if not options.hideBtn then
-			pcall(MoveRM_BuildHideFallback);
+	for _, spec in ipairs(MoveRM_PICKERS) do
+		if options and not options[spec.key] then
+			pcall(MoveRM_BuildPicker, spec);
+			if not options[spec.key] then
+				pcall(MoveRM_BuildPickerFallback, spec);
+			end
 		end
 	end
 	MoveRM_BuildInfoIcons(); -- icons ride the controls, labels re-anchor to them
@@ -1305,13 +1212,9 @@ local function MoveRM_OnEvent(self, event, arg1)
 				db = _G[ADDON_NAME];
 				MoveRM_Sanitize(db);
 			end
-			if MoveRM_LoadState() then
-				MoveRM_EnsureInit();
-			end
-			-- unregister LAST: EnsureInit re-registers everything above,
-			-- so unsubscribing first would resurrect in the same tick.
-			-- The handler is idempotent anyway, so a lingering
-			-- registration would be harmless regardless.
+			MoveRM_LoadState();
+			MoveRM_addonLoadedSeen = true; -- later inits never re-subscribe
+			MoveRM_EnsureInit();
 			self:UnregisterEvent("ADDON_LOADED");
 		end
 	elseif event == "PLAYER_ENTERING_WORLD" or event == "ZONE_CHANGED"
@@ -1330,9 +1233,12 @@ end
 
 -- All event installs funnel through here. Re-registering is a no-op and the
 -- script is simply replaced, so repeated EnsureInit calls stay cheap.
-local function MoveRM_RegisterAddonEventsInner()
-	if not MoveRM_EventFrame then return end
-	MoveRM_EventFrame:RegisterEvent("ADDON_LOADED");
+-- ADDON_LOADED only until our own has been consumed: a later slash re-init
+-- must not leave us listening to every load-on-demand addon.
+MoveRM_RegisterAddonEvents = function()
+	if not MoveRM_addonLoadedSeen then
+		MoveRM_EventFrame:RegisterEvent("ADDON_LOADED");
+	end
 	MoveRM_EventFrame:RegisterEvent("PLAYER_ENTERING_WORLD");
 	MoveRM_EventFrame:RegisterEvent("ZONE_CHANGED");
 	MoveRM_EventFrame:RegisterEvent("ZONE_CHANGED_NEW_AREA");
@@ -1340,8 +1246,7 @@ local function MoveRM_RegisterAddonEventsInner()
 	MoveRM_EventFrame:RegisterEvent("GROUP_ROSTER_UPDATE");
 	MoveRM_EventFrame:RegisterEvent("PARTY_LEADER_CHANGED");
 	MoveRM_EventFrame:SetScript("OnEvent", MoveRM_OnEvent);
-end
-MoveRM_RegisterAddonEvents = MoveRM_RegisterAddonEventsInner;
+end;
 
 MoveRM_EventFrame = CreateFrame("Frame", "Move_CompactRaidFrameManagerEventFrame");
 
@@ -1356,17 +1261,10 @@ MoveRM_EnsureInit();
 -- ----------------------------------------------------------------------------
 SLASH_MOVERM1 = "/moverm";
 SlashCmdList.MOVERM = function(msg)
-	if not MoveRM_stateLoaded then
-		if not MoveRM_LoadState() then
-			return; -- unknown layout: inert, SavedVariables untouched
-		end
-	end
+	MoveRM_LoadState();
 	-- re-entry is cheap and idempotent: a missed ADDON_LOADED (refused
 	-- registration) resumes here.
 	MoveRM_EnsureInit();
-	if not db then
-		return; -- settings are not loaded yet
-	end
 	msg = string.lower(string.match(msg or "", "^%s*(.-)%s*$") or "");
 	if msg == "reset" then
 		MoveRM_Reset();

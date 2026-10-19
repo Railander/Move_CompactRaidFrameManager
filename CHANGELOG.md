@@ -1,5 +1,10 @@
 # Move Raid Manager Changelog
 
+## v2.3.3
+- Fixed: on every version except Midnight and Forever, the `always` Hide setting now also hides the expanded panel's buttons, not just its background.
+- Pressing Escape in the Y box now cancels the edit and shows the saved value again.
+- Expanding and collapsing the manager at its saved spot no longer touches the game's own placement at all.
+
 ## v2.3.2
 - The manager now works in World of Warcraft: Midnight (12.1.5). Nothing changes in game.
 

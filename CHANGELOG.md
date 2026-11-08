@@ -1,5 +1,10 @@
 # Move Raid Manager Changelog
 
+## v2.3.5
+- Fixed: the yellow move-mode preview now matches the real party-leader panel height (it was 1 px too tall on Midnight, and 20 px too tall on the classic versions). Raid leader and assist layouts are taller than that preview, so park those with a manual margin.
+- Fixed: Forever now previews its own party-leader panel height (319 px, because that client hides its difficulty row) instead of Midnight's 359 px, so the yellow preview no longer overshoots by 40 px. Midnight keeps 359 px and the classic versions 175 px.
+- Fixed: a saved setting containing a NaN or infinite value (the manager's position, the window's position, or the Hide/Strata pick) now heals to the default instead of leaving the manager, the window or its pickers unusable.
+
 ## v2.3.4
 - The manager (in move mode) and the configuration window now move the moment you press the mouse button, with no dead zone before they start following the cursor. The expand/collapse strip still needs a short drag first, so a plain click on it keeps working.
 

@@ -97,6 +97,12 @@ local function MoveRM_Round2(v)
 	return math.floor(v * 100 + 0.5) / 100;
 end
 
+-- NaN and the infinities are numbers (not nil), so a corrupt save can carry
+-- one into SetPoint or the Y box; heal them like any other bad coordinate.
+local function MoveRM_IsFinite(v)
+	return v == v and v ~= math.huge and v ~= -math.huge;
+end
+
 local db; -- alias for the Move_CompactRaidFrameManager SavedVariables table, set on ADDON_LOADED
 local options, refreshWindow; -- config window and its refresher, built below
 
@@ -376,8 +382,8 @@ local function MoveRM_Sanitize(dbt)
 		dbt.y = stockY;
 	end
 	dbt.y = tonumber(dbt.y) or stockY;
-	if dbt.y < -MAX_COORD or dbt.y > MAX_COORD then
-		dbt.y = stockY;
+	if dbt.y < -MAX_COORD or dbt.y > MAX_COORD or not MoveRM_IsFinite(dbt.y) then
+		dbt.y = stockY; -- range or NaN/inf: a corrupt coordinate
 	end
 	dbt.y = MoveRM_Round2(dbt.y); -- heal float32 layout drift from older saves
 	-- hide carryover: the checkbox era saved fade as true/false (v1 included).
@@ -389,7 +395,8 @@ local function MoveRM_Sanitize(dbt)
 	dbt.fade = nil;
 	if dbt.hide ~= nil then
 		dbt.hide = math.floor(tonumber(dbt.hide) or 0);
-		if dbt.hide < 1 or dbt.hide > MAX_HIDE then
+		-- NaN survives both comparisons and floor(); heal it like a bad range
+		if dbt.hide < 1 or dbt.hide > MAX_HIDE or not MoveRM_IsFinite(dbt.hide) then
 			dbt.hide = nil;
 		end
 	end
@@ -398,7 +405,7 @@ local function MoveRM_Sanitize(dbt)
 	end
 	if dbt.strata ~= nil then
 		dbt.strata = math.floor(tonumber(dbt.strata) or 0);
-		if dbt.strata < 1 or dbt.strata > MAX_STRATA then
+		if dbt.strata < 1 or dbt.strata > MAX_STRATA or not MoveRM_IsFinite(dbt.strata) then
 			dbt.strata = nil;
 		end
 	end
@@ -412,6 +419,12 @@ local function MoveRM_Sanitize(dbt)
 	end
 	dbt.win.x = MoveRM_Round2(tonumber(dbt.win.x) or 0);
 	dbt.win.y = MoveRM_Round2(tonumber(dbt.win.y) or 0);
+	if not MoveRM_IsFinite(dbt.win.x) then
+		dbt.win.x = 0; -- NaN/inf window position: center, like a corrupt value
+	end
+	if not MoveRM_IsFinite(dbt.win.y) then
+		dbt.win.y = 0;
+	end
 end
 
 -- ----------------------------------------------------------------------------
@@ -536,18 +549,44 @@ end
 -- on a fresh install, solo, first session.
 -- MODERN (party leader: no filter options; five 40x40 buttons in rows of
 -- 4+1, one divider that resolves to ~0 height): 48 top offset + 40 + 0 + 40
--- + 10 + 99 raid markers + 5 + 13 restrict-pings label + 2 + 25 dropdown + 5
--- + 53 bottom buttons + 20 padding = 360.
+-- + 10 + 99 raid markers + 5 + 12 restrict-pings label + 2 + 25 dropdown + 5
+-- + 53 bottom buttons + 20 padding = 359 (the game's own
+-- UpdateOptionsFlowContainer measures 359). Five 40 px buttons flow as
+-- 4+1; the difficulty button is one of them, so hiding it drops the second
+-- row (40 px).
+-- FOREVER (1.60.x) shares the back/forward pair but hides that difficulty
+-- row entirely: none of its difficulties is user-selectable, so Blizzard
+-- omits the 40 px button and the party-lead panel is 359 - 40 = 319.
+-- (DifficultyUtil.HasAnyUserSelectableDifficulties() drives that gate in
+-- 1.60.1's raid manager; it is false there.)
 -- CLASSIC (200 wide): 50 raid markers + 65 leader options + 20 convert-to-
--- raid line + 20 edit-mode/hidden-mode line + 40 padding = 195. After a raid
--- without a /reload the game keeps a stale 4px offset (199): invisible in
--- practice, the clamp below still shows none expanded.
+-- raid line = 135, plus the 40 the manager's height formula adds = 175, the
+-- normal party-lead panel height. The extra edit-mode/hidden-mode row is
+-- inserted only in a raid (or while EditMode is active), so a raid
+-- leader/assist box is taller and simply clamps to no ghost (see below),
+-- rather than over-previewing every classic party; a raid member's shorter
+-- box shows a reduced remainder. After a raid without a /reload the game
+-- keeps a stale 4px offset (179): the preview is 4px short there and still
+-- clamps to no ghost.
 -- The ghost shows tall MINUS the current box height (see SyncMoveBox), so an
 -- expanded party-lead box shows no ghost while a solo box previews the full
--- reach. Raid layouts are taller (raid lead ~472) and clamp to no ghost.
--- Re-derive both numbers if the game's leader panel visibly changes.
-local MoveRM_TALL_MODERN = 360;
-local MoveRM_TALL_CLASSIC = 195;
+-- reach. Raid leader/assist layouts are taller and clamp to no ghost; a raid
+-- member's shorter panel shows a reduced remainder.
+-- Re-derive these numbers if the game's leader panel visibly changes.
+local MoveRM_TALL_MODERN = 359;
+local MoveRM_TALL_CLASSIC = 175;
+local MoveRM_TALL_FOREVER = 319;
+
+-- Forever is the 1.60.x family (interface 16000..19999). GetBuildInfo's 4th
+-- return is the interface number on every flavor (12.1.5 = 120105, 1.15.9 =
+-- 11509, 2.5.6 = 20506, 5.5.4 = 50504), so this split does not depend on a
+-- localized version string or on WOW_PROJECT_ID (Forever reports CLASSIC).
+local MoveRM_IS_FOREVER;
+do
+	local _, _, _, toc = GetBuildInfo();
+	toc = tonumber(toc) or 0;
+	MoveRM_IS_FOREVER = toc >= 16000 and toc < 20000;
+end
 
 -- Re-anchor the box, the ghost and the inputs over the manager's current
 -- rect. Only the manager reads can fail here (everything written is our own
@@ -578,10 +617,17 @@ MoveRM_SyncMoveBox = function()
 	-- the box's own height, if any -- a grouped leader's box already IS
 	-- tall, so no ghost (box + ghost always exactly cover the tall rect);
 	-- a solo box always previews the full lead reach. Rounded at the
-	-- boundary: live heights are float32, and raw dust (359.99999 vs the
-	-- 360 preview) must not raise a sliver of ghost. The family read is
+	-- boundary: live heights are float32, and raw dust (358.99999 vs the
+	-- 359 preview) must not raise a sliver of ghost. The family read is
 	-- plain Lua (same split as the fade router): no capture, no state.
-	local tall = (manager.toggleButton == nil) and MoveRM_TALL_MODERN or MoveRM_TALL_CLASSIC;
+	local tall;
+	if manager.toggleButton ~= nil then
+		tall = MoveRM_TALL_CLASSIC;
+	elseif MoveRM_IS_FOREVER then
+		tall = MoveRM_TALL_FOREVER;
+	else
+		tall = MoveRM_TALL_MODERN;
+	end
 	local extra = MoveRM_Round2(math.max(0, tall - h));
 	if MoveRM_moveGhost then
 		if extra > 0 then
@@ -910,7 +956,8 @@ local function MoveRM_BuildWindow()
 		end
 	end);
 	options:SetScript("OnHide", function(self)
-		-- hidden mid-move (Escape): finish the move so the spot is saved
+		-- hidden mid-move (close button or the slash toggle): finish the move
+		-- so the spot is saved instead of leaving StartMoving dangling
 		if self.moving then
 			self:GetScript("OnMouseUp")(self, "LeftButton");
 		end
@@ -922,10 +969,11 @@ end
 
 -- the strata picker needs the menu system; load it lazily (it ships
 -- on every target flavor) so the dropdown builds where it exists, and fall
--- back to a cycling button where it does not
+-- back to a cycling button where it does not. The loader lives in the
+-- C_AddOns namespace on every flavor -- there is no bare LoadAddOn global
 local function MoveRM_EnsureMenuUtil()
-	if not MenuUtil and LoadAddOn then
-		pcall(LoadAddOn, "Blizzard_Menu");
+	if not MenuUtil and C_AddOns and C_AddOns.LoadAddOn then
+		pcall(C_AddOns.LoadAddOn, "Blizzard_Menu");
 	end
 end
 
@@ -1201,8 +1249,11 @@ MoveRM_EnsureInit = function()
 			end
 		end
 	end
-	MoveRM_BuildInfoIcons(); -- icons ride the controls, labels re-anchor to them
-	MoveRM_LayoutControls(); -- center the widest row, align every box to it
+	-- cosmetic decoration on the window only: a refused widget (the icons are
+	-- own textures/frames) must never stop the position/strata/fade applies
+	-- below, which are the addon's actual job
+	pcall(MoveRM_BuildInfoIcons); -- icons ride the controls, labels re-anchor to them
+	pcall(MoveRM_LayoutControls); -- center the widest row, align every box to it
 	if MoveRM_stateLoaded then
 		MoveRM_ApplyPosition(); -- positions over the login re-anchor
 		MoveRM_ApplyStrata(); -- db.strata is backfilled above, always explicit
